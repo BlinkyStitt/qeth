@@ -121,16 +121,18 @@ BC-UR library vs. implementing the (well-specified) registry CBOR ourselves.
   it is tall) — left = the animated `segno` QR (a fresh fountain part per timer
   tick via `multipart.frame_source`); right = the live camera preview with the
   decoder running per frame; a complete decode → `accept()` returning the bytes;
-  cancel → `None`. The two panes **expand with the window**, starting with a
-  preferred 320 px QR side and 192 px camera side. The exchange window opens at
-  its natural size — the QR pane square (a wider window only adds blank bands
-  beside the QR) and compact, for close-range wallet cameras — or at the size
-  the user last resized it to (`Store.qr_exchange_size`, via the dialog's
-  `set_size_memory` hook MainWindow wires): how big a QR suits a wallet's camera
-  is tuned once. Bounded by the desktop. Each centers square content
-  (QR or 1:1 camera view) in its available space. A 3:1 column stretch gives the
-  request more space in a `QGridLayout` — captions in row 0, panes
-  in row 1 — so they stay aligned however a caption wraps. Spacing is the house
+  cancel → `None`. The two panes **expand with the window**, both preferring a
+  320 px side, with equal column stretch in a `QGridLayout`: captions in row 0,
+  panes in row 1, so they stay aligned however a caption wraps. The exchange
+  window opens with BOTH panes exactly square (squared up on first show, once
+  the layout is final): a wider QR column only added blank bands beside the QR,
+  a narrower camera one squeezed the video into a strip. It stays compact for
+  close-range wallet cameras. Or it opens at the size the user last resized it
+  to (`Store.qr_exchange_size`, via the dialog's `set_size_memory` hook
+  MainWindow wires): how big a QR suits a wallet's camera is tuned once.
+  Bounded by the desktop. Each pane centers square content (QR or 1:1 camera
+  view) in its available space; the white left around the QR is its 4-module
+  quiet zone plus up to a module of whole-pixel rounding. Spacing is the house
   rhythm: caption↔pane is `item_spacing` (within a paragraph), the between-column
   gap is `group_spacing` (two distinct groups). The shared `QRWidget` caches a
   one-pixel-per-module source and fits it using **whole physical pixels per

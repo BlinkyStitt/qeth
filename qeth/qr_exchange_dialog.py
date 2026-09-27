@@ -153,7 +153,10 @@ class QRExchangeDialog(Dialog):
         grid = QGridLayout()
         grid.setVerticalSpacing(item_spacing(self))
         grid.setHorizontalSpacing(group_spacing(self))
-        grid.setColumnStretch(0, 3)
+        # Equal columns: the QR and the camera view are both square content,
+        # so at the natural size both panes are square — no blank bands beside
+        # the QR, and the video isn't squeezed into a strip.
+        grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         grid.setRowStretch(1, 1)
         # Use each full column width so Qt's height-for-width calculation
@@ -168,7 +171,7 @@ class QRExchangeDialog(Dialog):
 
         scan_caption = QLabel("2. Point your camera at the wallet's signature QR:")
         scan_caption.setWordWrap(True)
-        self._preview = _CameraPreview(preferred_side=192)
+        self._preview = _CameraPreview(preferred_side=PANE)
         grid.addWidget(scan_caption, 0, 1, top)
         grid.addWidget(_view_framed(self._preview), 1, 1)
         root.addLayout(grid, 1)
@@ -188,6 +191,10 @@ class QRExchangeDialog(Dialog):
         remembered = _size_memory[0]() if _size_memory is not None else None
         size = QSize(*remembered) if remembered else self.sizeHint()
         self.resize(size.boundedTo(self.screen().availableGeometry().size()))
+        # No remembered size: square the panes up once shown (only then is the
+        # layout final — the Dialog base applies its spacing, and grows the
+        # height for wrapped captions, at show time).
+        self._square_on_show = not remembered
         # The size once on screen (after the base's show-time fitting): only
         # a change from it is the user's choice, worth remembering.
         self._opened_size: QSize | None = None
@@ -201,11 +208,26 @@ class QRExchangeDialog(Dialog):
         """The scanned ``ur:…`` string, or ``None`` if the user cancelled."""
         return self._scanned
 
+    def _square_panes(self) -> None:
+        """Widen the window so both (equal) panes are square: the natural size
+        lands them a few px narrower than tall."""
+        layout = self.layout()
+        assert layout is not None
+        layout.activate()
+        short = self._qr_label.height() - self._qr_label.width()
+        limit = self.screen().availableGeometry().width()
+        width = min(self.width() + 2 * short, limit)
+        if short > 0 and width > self.width():     # only ever widen
+            self.resize(width, self.height())
+            layout.activate()
+
     # --- lifecycle ---------------------------------------------------------
 
     def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 — Qt override
         super().showEvent(event)
         if self._opened_size is None:
+            if self._square_on_show:
+                self._square_panes()
             self._opened_size = self.size()
         if self._scanner is not None:
             self._scanner.start()

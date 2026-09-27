@@ -219,10 +219,20 @@ def test_dialog_accepts_the_first_scanned_ur(qtbot):
 
 
 def _advance(qtbot, dlg):
-    previous = dlg._animation.shown
-    dlg._animation.timer.start(0)
-    qtbot.waitUntil(lambda: dlg._animation.shown is not previous)
-    dlg._animation.timer.stop()
+    """Show exactly the next frame. Driving the tick directly, with the timer
+    stopped around it: restarting the timer and stopping it once a new frame
+    showed let a second frame through when the preparer thread (encoding QRs
+    in Python, holding the GIL) delayed the check past the next deadline."""
+    anim = dlg._animation
+    previous = anim.shown
+    anim.timer.stop()
+
+    def step() -> bool:
+        anim._deadline.next = 0.0         # due now
+        anim._tick()                      # shows the next prepared frame, if any
+        anim.timer.stop()                 # …and nothing after it
+        return anim.shown is not previous
+    qtbot.waitUntil(step)
 
 
 def test_dialog_animates_by_pulling_fresh_frames(qtbot):
@@ -282,6 +292,10 @@ def test_large_transfer_keeps_the_same_qr_grid_across_sequence_digits(qtbot):
     source = frame_source("eth-sign-request", payload)
     expected_source = frame_source("eth-sign-request", payload)
     dlg = _dialog(qtbot, _FakeScanner(), next_frame=source)
+    # Freeze the animation before the (slow) resize + show + render: at 10 fps
+    # frame 2 could otherwise be on screen by the first check, which expects
+    # frame 1. _advance then steps it exactly one frame at a time.
+    dlg._animation.timer.stop()
     # Use a desktop-sized viewport even when the offscreen test display is
     # reduced to 400 logical pixels by QT_SCALE_FACTOR=2.
     dlg.resize(1000, 720)
@@ -295,7 +309,8 @@ def test_large_transfer_keeps_the_same_qr_grid_across_sequence_digits(qtbot):
         widths.append(dlg._qr_label.pixmap().width())
         assert decode_qr(_qimage_to_gray(dlg._qr_label.grab().toImage())) == expected
     assert len(set(widths)) == 1
-    assert dlg._qr_label.width() > 2 * dlg._preview.width()
+    # Equal columns: the QR and the camera view are both square content.
+    assert abs(dlg._qr_label.width() - dlg._preview.width()) <= 2
 
 
 @pytest.mark.parametrize("payload_size", [120, 10_000])
@@ -471,15 +486,17 @@ def desktop(monkeypatch):
     monkeypatch.setattr(mod.QRExchangeDialog, "screen", lambda self: screen)
 
 
-def test_it_opens_at_its_natural_size_with_a_square_qr_pane(qtbot, desktop):
-    """No remembered size: the natural size, whose QR pane is (nearly)
-    square — a wider window only added blank bands beside the QR."""
+def test_it_opens_with_both_panes_square(qtbot, desktop):
+    """No remembered size: both panes square and equal — a wider QR column
+    only added blank bands beside the QR, a narrower camera one squeezed the
+    video into a strip."""
     import qeth.qr_exchange_dialog as mod
     mod.set_size_memory(None)
     dlg = _dialog(qtbot, _FakeScanner())
     dlg.show()
-    pane = dlg._qr_label
-    assert abs(pane.width() - pane.height()) <= 0.1 * pane.height()
+    qr, camera = dlg._qr_label, dlg._preview
+    assert qr.width() == qr.height()                  # no bands beside the QR
+    assert camera.size() == qr.size()                 # nor a squeezed video strip
 
 
 def test_the_size_the_user_chose_is_remembered(qtbot, desktop):
