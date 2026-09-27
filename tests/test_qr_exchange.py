@@ -456,3 +456,67 @@ def test_scan_dialog_cancel_returns_none(qtbot):
     dlg.show()
     dlg.reject()
     assert dlg.scanned_ur() is None and scanner.stopped == 1
+
+
+# --- window size: square pane at first, then what the user chose ---------------
+
+@pytest.fixture
+def desktop(monkeypatch):
+    """A desktop-sized screen: the offscreen test one is 400×300 logical (at
+    the suite's scale 2), and the dialog caps its size to the screen."""
+    from types import SimpleNamespace
+    from PySide6.QtCore import QRect
+    import qeth.qr_exchange_dialog as mod
+    screen = SimpleNamespace(availableGeometry=lambda: QRect(0, 0, 1920, 1080))
+    monkeypatch.setattr(mod.QRExchangeDialog, "screen", lambda self: screen)
+
+
+def test_it_opens_at_its_natural_size_with_a_square_qr_pane(qtbot, desktop):
+    """No remembered size: the natural size, whose QR pane is (nearly)
+    square — a wider window only added blank bands beside the QR."""
+    import qeth.qr_exchange_dialog as mod
+    mod.set_size_memory(None)
+    dlg = _dialog(qtbot, _FakeScanner())
+    dlg.show()
+    pane = dlg._qr_label
+    assert abs(pane.width() - pane.height()) <= 0.1 * pane.height()
+
+
+def test_the_size_the_user_chose_is_remembered(qtbot, desktop):
+    import qeth.qr_exchange_dialog as mod
+    from PySide6.QtCore import QSize
+    saved: list = []
+    mod.set_size_memory((lambda: (700, 500), saved.append))
+    try:
+        dlg = _dialog(qtbot, _FakeScanner())
+        dlg.show()
+        assert dlg.size() == QSize(700, 500)          # opens at the remembered size
+        dlg.reject()
+        assert saved == []                            # not resized → nothing to save
+        dlg = _dialog(qtbot, _FakeScanner())
+        dlg.show()
+        dlg.resize(760, 540)
+        dlg.reject()
+        assert saved == [(760, 540)]
+    finally:
+        mod.set_size_memory(None)
+
+
+def test_the_size_is_kept_in_the_config(tmp_qeth):
+    from qeth.store import Store
+    s = Store.load()
+    assert s.qr_exchange_size is None
+    s.set_qr_exchange_size((760, 540))
+    assert Store.load().qr_exchange_size == (760, 540)
+
+
+def test_the_main_window_wires_the_memory_to_the_store(mainwindow):
+    import qeth.qr_exchange_dialog as mod
+    try:
+        mainwindow.store.qr_exchange_size = (640, 480)
+        load, save = mod._size_memory
+        assert load() == (640, 480)
+        save((700, 500))
+        assert mainwindow.store.qr_exchange_size == (700, 500)
+    finally:
+        mod.set_size_memory(None)

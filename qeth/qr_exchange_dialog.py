@@ -14,7 +14,7 @@ from collections.abc import Callable
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap, QResizeEvent
+from PySide6.QtGui import QImage, QPixmap, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QDialogButtonBox,
     QGridLayout,
@@ -31,6 +31,20 @@ from .qr_widget import QRWidget, qr_to_pixmap
 
 # Initial preferred side; the panes expand with the window.
 PANE = 320
+
+# Where the exchange window's size is remembered (MainWindow wires it to the
+# Store): ``load() -> (w, h) | None`` and ``save((w, h))``. How big a QR
+# suits a wallet's camera is the user's to tune, once — a close-focus camera (a
+# Keycard Shell) wants it compact, a far-focus one bigger. Unset (tests, no
+# main window) → the natural size every time.
+SizeMemory = tuple[Callable[[], "tuple[int, int] | None"],
+                   Callable[["tuple[int, int] | None"], None]]
+_size_memory: SizeMemory | None = None
+
+
+def set_size_memory(memory: SizeMemory | None) -> None:
+    global _size_memory
+    _size_memory = memory
 
 
 def ur_to_pixmap(ur_string: str, *, scale: int = 8) -> QPixmap:
@@ -168,9 +182,15 @@ class QRExchangeDialog(Dialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-        # Start with a compact QR so a short-focus wallet camera can frame it
-        # at close range. Resizing the window still enlarges or shrinks it.
-        self.resize(QSize(620, 420).boundedTo(self.screen().availableGeometry().size()))
+        # The size the user last left it at; else the natural size, whose QR
+        # pane is square (a wider window only adds blank bands beside the QR)
+        # and compact — a short-focus wallet camera can frame it up close.
+        remembered = _size_memory[0]() if _size_memory is not None else None
+        size = QSize(*remembered) if remembered else self.sizeHint()
+        self.resize(size.boundedTo(self.screen().availableGeometry().size()))
+        # The size once on screen (after the base's show-time fitting): only
+        # a change from it is the user's choice, worth remembering.
+        self._opened_size: QSize | None = None
 
         if self._scanner is not None:
             self._scanner.decoded.connect(self._on_decoded)
@@ -183,8 +203,10 @@ class QRExchangeDialog(Dialog):
 
     # --- lifecycle ---------------------------------------------------------
 
-    def showEvent(self, event: Any) -> None:  # noqa: N802 — Qt override
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 — Qt override
         super().showEvent(event)
+        if self._opened_size is None:
+            self._opened_size = self.size()
         if self._scanner is not None:
             self._scanner.start()
         else:
@@ -194,6 +216,9 @@ class QRExchangeDialog(Dialog):
         self._animation.stop()
         if self._scanner is not None:
             self._scanner.stop()
+        if (_size_memory is not None and self._opened_size is not None
+                and self.size() != self._opened_size):
+            _size_memory[1]((self.width(), self.height()))
         super().done(result)
 
     # --- scanner signals ---------------------------------------------------
