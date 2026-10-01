@@ -208,6 +208,10 @@ class Store:
         # token panel) and the inner vertical split (tree vs details).
         self.splitter_state_main: str | None = None
         self.splitter_state_left: str | None = None
+        # The air-gapped QR exchange window's size (logical px), once the user
+        # resized it — how big a QR suits their wallet's camera. None = the
+        # window's natural size.
+        self.qr_exchange_size: tuple[int, int] | None = None
         # Per-panel header state (hex of QHeaderView.saveState()), keyed
         # by an opaque panel name. Lets users drag columns to widths
         # they prefer and have those persist across runs.
@@ -293,6 +297,10 @@ class Store:
             s.window_geometry = data.get("window_geometry")
             s.splitter_state_main = data.get("splitter_state_main")
             s.splitter_state_left = data.get("splitter_state_left")
+            qr_size = data.get("qr_exchange_size")
+            if (isinstance(qr_size, list) and len(qr_size) == 2
+                    and all(isinstance(v, int) and v > 0 for v in qr_size)):
+                s.qr_exchange_size = (qr_size[0], qr_size[1])
             raw_headers = data.get("header_states") or {}
             if isinstance(raw_headers, dict):
                 s.header_states = {
@@ -355,6 +363,8 @@ class Store:
                 "window_geometry": self.window_geometry,
                 "splitter_state_main": self.splitter_state_main,
                 "splitter_state_left": self.splitter_state_left,
+                "qr_exchange_size": (list(self.qr_exchange_size)
+                                     if self.qr_exchange_size else None),
                 "header_states": dict(self.header_states),
                 "etherscan_api_key": self.etherscan_api_key,
                 "notifications_enabled": self.notifications_enabled,
@@ -786,6 +796,13 @@ class Store:
     def set_window_geometry(self, geometry_hex: str) -> None:
         with self._lock:
             self.window_geometry = geometry_hex
+        self.save()
+
+    def set_qr_exchange_size(self, size: tuple[int, int] | None) -> None:
+        with self._lock:
+            if size == self.qr_exchange_size:
+                return
+            self.qr_exchange_size = size
         self.save()
 
     def set_splitter_states(self, main_hex: str, left_hex: str) -> None:
