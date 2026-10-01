@@ -4473,7 +4473,7 @@ class TransactionDetailsDialog(Dialog):
         # ABIs are fetched per target and folded into the tree we keep here,
         # which is re-rendered as each one lands.
         self._decoded_tree: dict | None = None
-        self._batch_abi_inflight: set[str] = set()
+        self._batch_abi_requested: set[str] = set()
         # Optional dependencies for ERC-20 annotation on the "To:" row.
         # Plugin passes both when available; tests can leave them None
         # and the dialog falls back to a plain address line.
@@ -4767,18 +4767,20 @@ class TransactionDetailsDialog(Dialog):
             token_info=self._token_info)
         if self._abi_source is None:
             return
-        for addr in sorted(pending):
-            if addr in self._batch_abi_inflight:
-                continue
-            self._batch_abi_inflight.add(addr)
+        # Once per target per dialog: a failed fetch caches nothing, so the
+        # re-render reports the target as pending again — re-requesting it
+        # there looped forever (a 429 storm that outlived the dialog). An
+        # entry whose fetch failed keeps its selector; re-opening retries.
+        for addr in sorted(pending - self._batch_abi_requested):
+            self._batch_abi_requested.add(addr)
             worker = AbiFetchWorker(
                 self._abi_source, self._abi_cache, self.chain.chain_id, addr)
-            worker.ready.connect(
-                lambda _abi, a=addr: self._on_batch_abi_ready(a))
+            # A bound slot, not a lambda: Qt drops the connection when the
+            # dialog is destroyed, so a fetch landing after close is ignored.
+            worker.ready.connect(self._on_batch_abi_ready)
             self._start_worker(worker)
 
-    def _on_batch_abi_ready(self, addr: str) -> None:
-        self._batch_abi_inflight.discard(addr)
+    def _on_batch_abi_ready(self, _abi) -> None:
         if self._decoded_tree is not None:
             self._render_decoded_call(self._decoded_tree)
 
