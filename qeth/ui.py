@@ -216,6 +216,11 @@ class MainWindow(QMainWindow):
         if _mainnet is not None:
             _helios_prewarm(_mainnet)
 
+        # The QR exchange window's size is remembered in the store too.
+        from . import qr_exchange_dialog
+        qr_exchange_dialog.set_size_memory(
+            (lambda: self.store.qr_exchange_size, self.store.set_qr_exchange_size))
+
         # Restore prior window geometry + splitter states.
         if self.store.window_geometry:
             try:

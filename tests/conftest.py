@@ -277,6 +277,17 @@ def _reset_trongrid_pacer():
 
 
 @pytest.fixture(autouse=True)
+def _forget_qr_window_size():
+    """MainWindow wires the QR exchange window's size memory (process-wide) to
+    its store — unwire it so a later test's dialog doesn't load or save
+    through a finished test's store."""
+    yield
+    mod = sys.modules.get("qeth.qr_exchange_dialog")
+    if mod is not None:
+        mod.set_size_memory(None)
+
+
+@pytest.fixture(autouse=True)
 def _lock_hot_wallets():
     """The unlocked hot wallet (``hot_wallet.UNLOCKED``) is process-wide: a test
     that signs would otherwise leave its key unlocked — and its expiry timer

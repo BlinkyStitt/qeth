@@ -22,17 +22,14 @@ from __future__ import annotations
 
 import logging
 
-import io
 from typing import Any, cast
-
-import segno
 
 
 log = logging.getLogger("qeth.plugin.wallets")
 
 from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QAction, QFont, QIcon, QKeySequence, QPalette, QPixmap,
+    QAction, QFont, QIcon, QKeySequence, QPalette,
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
@@ -59,6 +56,7 @@ from ...qr.schemes import (
     scheme_origin,
 )
 from ...plugin import Plugin
+from ...qr_widget import QRWidget
 
 # Item data role carrying an account's user label. Present only on labeled
 # account rows; the shared selection delegate (ui.py) reads it to paint
@@ -2177,10 +2175,8 @@ class AccountInfoDialog(Dialog):
         v.addLayout(form)
 
         # form / QR / buttons are three paragraphs — the Dialog base spaces them.
-        self.qr_lbl = QLabel()
-        self.qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.qr_lbl.setFixedSize(220, 220)
-        v.addWidget(self.qr_lbl, 0, Qt.AlignmentFlag.AlignCenter)
+        self.qr_lbl = QRWidget(preferred_side=220)
+        v.addWidget(self.qr_lbl, 1)
         self._render_qr(shown)
 
         btns = QDialogButtonBox()
@@ -2194,18 +2190,11 @@ class AccountInfoDialog(Dialog):
         v.addWidget(btns)
 
     def _render_qr(self, address: str) -> None:
-        buf = io.BytesIO()
         # ethereum: URI per EIP-681 so wallets recognize it as a send intent.
-        # Tron has no such URI scheme — its wallets scan the bare T… address.
+        # Tron has no such URI scheme — its wallets scan the bare T… address
+        # (case preserved: base58 is case-sensitive).
         payload = f"ethereum:{address}" if self._family == EVM else address
-        segno.make(payload, error="m").save(
-            buf, kind="png", scale=6, border=2)
-        pix = QPixmap()
-        pix.loadFromData(buf.getvalue())  # format auto-detected from the PNG header
-        self.qr_lbl.setPixmap(pix.scaled(
-            self.qr_lbl.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        ))
+        self.qr_lbl.set_content(payload, error="m")
 
 
 # --- Token list panel -------------------------------------------------------
