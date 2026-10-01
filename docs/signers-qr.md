@@ -151,7 +151,7 @@ BC-UR library vs. implementing the (well-specified) registry CBOR ourselves.
   address's case and the `ethereum:` URI.
 - Animated signing requests target **120-byte fragments** (typically QR v9),
   prioritizing larger modules for low-resolution cameras over fewer frames.
-  Requests up to 150 bytes remain static. The trial targets **10 fps** using
+  Requests up to 150 bytes remain static. The animation targets **10 fps** using
   fractional monotonic deadlines. A background worker prepares at most four
   images ahead; only installing/resizing the image happens on the GUI thread.
   If preparation or the GUI falls behind, the current QR stays visible and
@@ -257,10 +257,5 @@ ends at the operator's keypress, so it includes manual reaction time.
 
 Physical results include one short framing pair favoring fixed version, which
 the operator chose to retain. No rate is yet established as faster on hardware.
-See `docs/qr10-validation.md` for the current trial, `docs/qr15-validation.md`
-for the physical framing results, and `docs/qr12-validation.md` for the earlier
-fixed-grid trial.
-
-For the matched fixed-version/per-frame comparison, use
-[the framing trial protocol](qr-framing-trials.md). It holds 15 fps constant
-and includes a dense payload that actually crosses QR version boundaries.
+The diagnostic draws the code with the signing pane's `QR_FILL` margin, so its
+`--qr-size` is the pane, not the code.

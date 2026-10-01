@@ -24,6 +24,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 from qeth.qr import eth, multipart
 from qeth.qr_animation import PreparedFrame, QRAnimation, TARGET_FPS
+from qeth.qr_exchange_dialog import QR_FILL
 from qeth.qr_widget import QRWidget
 
 
@@ -76,7 +77,8 @@ class FountainWindow(QWidget):
         self._animation: QRAnimation | None = None
         self.setWindowTitle(f"qeth QR trial — {args.fps:g} fps")
         layout = QVBoxLayout(self)
-        self._qr = QRWidget(preferred_side=args.qr_size)
+        # The signing pane's margin too, so the code is the size signing shows.
+        self._qr = QRWidget(preferred_side=args.qr_size, fill=QR_FILL)
         self._qr.setFixedSize(args.qr_size, args.qr_size)
         layout.addWidget(self._qr, alignment=Qt.AlignmentFlag.AlignCenter)
         self._status = QLabel()
@@ -163,6 +165,7 @@ class FountainWindow(QWidget):
             "seed": self._args.seed,
             "fragment_len": self._args.fragment_len,
             "qr_logical_px": self._args.qr_size,
+            "qr_fill": QR_FILL,
             "dpr": self._qr.devicePixelRatioF(),
             "brightness": self._args.brightness,
             "distance_cm": self._args.distance_cm,
