@@ -125,9 +125,13 @@ BC-UR library vs. implementing the (well-specified) registry CBOR ourselves.
   and the 1:1 camera view) laid out in a `QGridLayout` — captions in row 0, panes
   in row 1 — so they stay aligned however a caption wraps. Spacing is the house
   rhythm: caption↔pane is `item_spacing` (within a paragraph), the between-column
-  gap is `group_spacing` (two distinct groups). The QR is rendered large by
-  `ur_to_pixmap` then scaled to the pane with **nearest-neighbour** (hard module
-  edges, best for the device's scan, vs. grey-fringed smooth scaling); the camera
+  gap is `group_spacing` (two distinct groups). The QR pane is **white** edge to
+  edge, with the code (incl. its 4-module quiet zone) centred in at most
+  `QR_FILL` (¾) of it, so the frame, captions and the moving camera image stay
+  clear of the code (`_fit_qr`). `ur_to_pixmap` renders one pixel per module,
+  enlarged by a whole number of *physical* pixels per module (DPR-aware, every
+  module the same width) with **nearest-neighbour** (hard module edges, best for
+  the device's scan, vs. grey-fringed smooth scaling); the camera
   frame is scaled *expanding* + centre-cropped to fill the square (the decoder
   still runs on the full frame, so no scan area is lost). Each pane sits in the
   theme's native sunken **"view" frame** via `_view_framed` (a `QScrollArea`

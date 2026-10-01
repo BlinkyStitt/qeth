@@ -16,7 +16,7 @@ from typing import Any
 
 import segno
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QDialogButtonBox,
     QGridLayout,
@@ -34,18 +34,47 @@ from .dialog import Dialog, group_spacing, item_spacing
 # larger or smaller.
 PANE = 320
 
+# Share of the QR pane's side the code itself (with its 4-module quiet zone) may
+# cover. The rest of the pane is white too, keeping the frame, the captions and
+# the live camera image next to it further from the code.
+QR_FILL = 0.75
 
-def ur_to_pixmap(ur_string: str, *, scale: int = 8) -> QPixmap:
+
+def ur_to_pixmap(ur_string: str, *, scale: int = 1) -> QPixmap:
     """Render a UR string as a QR ``QPixmap``. UR is uppercased so the QR uses
     the compact alphanumeric mode (``ur:``/``/``/``-`` and digits are all in
-    that charset). ``scale`` is the source px-per-module — high enough that the
-    dialog can scale the result down to its pane crisply (the on-screen size is
-    the dialog's ``PANE``, not this)."""
+    that charset). ``scale`` is the source px-per-module; the dialog enlarges
+    the one-pixel source by whole pixels (:func:`_fit_qr`)."""
     buf = io.BytesIO()
     segno.make(ur_string.upper(), error="l").save(buf, kind="png", scale=scale)
     pixmap = QPixmap()
     pixmap.loadFromData(buf.getvalue())   # PNG auto-detected
     return pixmap
+
+
+def _fit_qr(source: QPixmap, pane: int, dpr: float) -> QPixmap:
+    """A white ``pane``-sized square (logical px) with the QR centred in it.
+
+    The one-pixel-per-module ``source`` is enlarged by the largest WHOLE number
+    of physical pixels per module that keeps the code within ``QR_FILL`` of the
+    pane — every module the same width. FastTransformation (nearest) keeps the
+    edges hard black/white, best for the device's scan, rather than the grey
+    fringes smooth scaling gives. The white is painted here, not as the label's
+    background, which a theme may override."""
+    side = int(pane * dpr)
+    per_module = max(1, int(side * QR_FILL) // source.width())
+    pixels = source.width() * per_module
+    canvas = QPixmap(side, side)
+    canvas.fill(Qt.GlobalColor.white)
+    painter = QPainter(canvas)
+    offset = (side - pixels) // 2
+    painter.drawPixmap(offset, offset, source.scaled(
+        pixels, pixels,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.FastTransformation))
+    painter.end()
+    canvas.setDevicePixelRatio(dpr)
+    return canvas
 
 
 def _fill_square(pixmap: QPixmap, size: Any) -> QPixmap:
@@ -149,6 +178,8 @@ class QRExchangeDialog(Dialog):
 
     def showEvent(self, event: Any) -> None:  # noqa: N802 — Qt override
         super().showEvent(event)
+        if self._shown is not None:   # redraw for the screen it opened on
+            self._paint_qr(self._shown)
         if self._scanner is not None:
             self._scanner.start()
         else:
@@ -167,14 +198,11 @@ class QRExchangeDialog(Dialog):
         ur_string = self._next_frame()
         if ur_string != self._shown:      # a constant single part renders once
             self._shown = ur_string
-            # Fit the QR to the square pane. FastTransformation (nearest) keeps
-            # the module edges hard black/white — best for the device's scan —
-            # rather than the grey-fringed edges smooth scaling would give.
-            pixmap = ur_to_pixmap(ur_string).scaled(
-                PANE, PANE,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation)
-            self._qr_label.setPixmap(pixmap)
+            self._paint_qr(ur_string)
+
+    def _paint_qr(self, ur_string: str) -> None:
+        self._qr_label.setPixmap(_fit_qr(
+            ur_to_pixmap(ur_string), PANE, self._qr_label.devicePixelRatioF()))
 
     # --- scanner signals ---------------------------------------------------
 

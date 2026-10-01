@@ -4,6 +4,7 @@ QtMultimedia — those are verified on hardware)."""
 
 import io
 
+import pytest
 import segno
 from cbor2 import CBORTag, dumps
 from PIL import Image
@@ -277,6 +278,40 @@ def test_ur_to_pixmap_is_non_null(qtbot):
     from qeth.qr_exchange_dialog import ur_to_pixmap
     pm = ur_to_pixmap(_signature_ur())
     assert not pm.isNull() and pm.width() > 0
+
+
+@pytest.mark.parametrize("dpr", [1.0, 1.5, 2.0])
+def test_qr_sits_centred_on_a_white_pane_at_whole_pixels(qtbot, dpr):
+    """The pane is white edge to edge and the code covers at most QR_FILL of
+    it, centred, every module the same whole number of physical pixels — so the
+    frame, captions and camera image stay clear of the code."""
+    from PySide6.QtGui import QColor
+
+    from qeth.qr_exchange_dialog import PANE, QR_FILL, _fit_qr, ur_to_pixmap
+    source = ur_to_pixmap(_signature_ur())          # one pixel per module
+    pm = _fit_qr(source, PANE, dpr)
+    img = pm.toImage()
+    side = int(PANE * dpr)
+    assert img.width() == img.height() == side
+    assert pm.devicePixelRatio() == dpr
+    per_module = int(side * QR_FILL) // source.width()
+    assert per_module >= 1
+    code = source.width() * per_module
+    assert code <= side * QR_FILL
+    offset = (side - code) // 2
+
+    def dark(x: int, y: int) -> bool:
+        return QColor(img.pixel(x, y)).lightness() < 128
+
+    assert not dark(0, 0) and not dark(side - 1, side - 1)   # white pane
+    # The top-left finder starts right after the 4-module quiet zone and is
+    # exactly 7 modules wide.
+    start = offset + 4 * per_module
+    assert not dark(start - 1, start) and dark(start, start)
+    assert dark(start + 7 * per_module - 1, start)
+    assert not dark(start + 7 * per_module, start)
+    from qeth.qr_scan import _qimage_to_gray
+    assert decode_qr(_qimage_to_gray(img)) == _signature_ur().upper()
 
 
 def test_scan_dialog_accepts_first_ur_and_runs_camera(qtbot):
