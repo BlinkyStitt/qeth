@@ -1,6 +1,7 @@
 """Decode the actual displayed pixels, including resize and display scaling."""
 
 import io
+import math
 
 import pytest
 import segno
@@ -45,6 +46,54 @@ def test_display_has_uniform_modules_full_border_and_exact_payload(
     )
     assert ImageChops.difference(displayed, expected).getbbox() is None
 
+
+
+@pytest.mark.parametrize("size", [(320, 320), (533, 411)])
+def test_fill_leaves_a_white_margin_with_uniform_modules(qtbot, size):
+    """With ``fill`` the code (and its quiet zone) covers at most that share of
+    the square, centred, everything else white — modules still uniform."""
+    content = frame_source("eth-sign-request", bytes(120))().upper()
+    widget = QRWidget(fill=0.75)
+    qtbot.addWidget(widget)
+    widget.set_content(content, error="l")
+    widget.resize(*size)
+    widget.show()
+    displayed = _qimage_to_gray(widget.grab().toImage())
+    assert decode_qr(displayed) == content
+
+    qr = segno.make_qr(content, error="l")
+    module_count = qr.symbol_size()[0]
+    scale = int(min(displayed.size) * 0.75) // module_count
+    assert scale >= 1
+    buf = io.BytesIO()
+    qr.save(buf, kind="png", scale=scale, border=4)
+    symbol = Image.open(buf).convert("L")
+    assert symbol.width <= min(displayed.size) * 0.75
+    expected = Image.new("L", displayed.size, 255)
+    expected.paste(
+        symbol,
+        (
+            (displayed.width - symbol.width) // 2,
+            (displayed.height - symbol.height) // 2,
+        ),
+    )
+    assert ImageChops.difference(displayed, expected).getbbox() is None
+
+
+def test_fill_gives_way_before_the_code_stops_fitting(qtbot):
+    """A code too big for ``fill`` of the square but within the whole square is
+    still shown (one pixel per module), never blanked for the margin's sake."""
+    content = "UR:" + "A" * 3000                   # 157 modules with quiet zone
+    widget = QRWidget(fill=0.75)
+    qtbot.addWidget(widget)
+    widget.set_content(content, error="l")
+    widget.setMinimumSize(0, 0)
+    widget.show()
+    # 170 physical px: the code fits the square, but not 0.75 of it (127).
+    side = math.ceil(170 / widget.devicePixelRatioF())
+    widget.resize(side, side)
+    assert not widget.pixmap().isNull()
+    assert decode_qr(_qimage_to_gray(widget.grab().toImage())) == content
 
 def test_resize_reuses_encoding_and_new_content_replaces_cache(qtbot, monkeypatch):
     import qeth.qr_widget as qr_widget

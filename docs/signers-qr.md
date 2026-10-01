@@ -131,8 +131,11 @@ BC-UR library vs. implementing the (well-specified) registry CBOR ourselves.
   to (`Store.qr_exchange_size`, via the dialog's `set_size_memory` hook
   MainWindow wires): how big a QR suits a wallet's camera is tuned once.
   Bounded by the desktop. Each pane centers square content (QR or 1:1 camera
-  view) in its available space; the white left around the QR is its 4-module
-  quiet zone plus up to a module of whole-pixel rounding. Spacing is the house
+  view) in its available space. The QR pane is white edge to edge and the code
+  (with its 4-module quiet zone) covers at most `QR_FILL` (¾) of it
+  (`QRWidget(fill=…)`), keeping the frame, captions and the moving camera image
+  off the code; the margin gives way before the code would stop fitting at one
+  pixel per module. Spacing is the house
   rhythm: caption↔pane is `item_spacing` (within a paragraph), the between-column
   gap is `group_spacing` (two distinct groups). The shared `QRWidget` caches a
   one-pixel-per-module source and fits it using **whole physical pixels per

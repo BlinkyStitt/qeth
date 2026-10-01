@@ -84,9 +84,15 @@ class QRWidget(QWidget):
     cannot raise its minimum size and prevent it from shrinking again.
     """
 
-    def __init__(self, parent: QWidget | None = None, *, preferred_side: int = 320):
+    def __init__(
+        self, parent: QWidget | None = None, *, preferred_side: int = 320,
+        fill: float = 1.0,
+    ):
         super().__init__(parent)
         self._preferred_side = preferred_side
+        # Share of the square the code (with its quiet zone) may cover; the rest
+        # is white too, keeping whatever surrounds the widget off the code.
+        self._fill = fill
         self._source = QPixmap()
         self._rendered = QPixmap()
         self._render_key: tuple[int, float] | None = None
@@ -127,12 +133,15 @@ class QRWidget(QWidget):
         dpr = self.devicePixelRatioF()
         physical_size = self.size() * dpr  # Match Qt's backing-store rounding.
         side = min(physical_size.width(), physical_size.height())
-        scale = side // self._source.width()
+        width = self._source.width()
+        # The margin gives way before the modules do: one pixel per module
+        # whenever the whole square still holds the code.
+        scale = int(side * self._fill) // width or min(1, side // width)
         if scale < 1:
             return QPixmap()  # Never crop or downsample away entire modules.
         key = (scale, dpr)
         if key != self._render_key:
-            pixels = self._source.width() * scale
+            pixels = width * scale
             self._rendered = self._source.scaled(
                 pixels,
                 pixels,

@@ -32,6 +32,11 @@ from .qr_widget import QRWidget, qr_to_pixmap
 # Initial preferred side; the panes expand with the window.
 PANE = 320
 
+# Share of the QR pane's side the code itself (with its 4-module quiet zone) may
+# cover. The rest of the pane is white too, keeping the frame, the captions and
+# the live camera image next to it further from the code.
+QR_FILL = 0.75
+
 # Where the exchange window's size is remembered (MainWindow wires it to the
 # Store): ``load() -> (w, h) | None`` and ``save((w, h))``. How big a QR
 # suits a wallet's camera is the user's to tune, once — a close-focus camera (a
@@ -165,7 +170,7 @@ class QRExchangeDialog(Dialog):
 
         show_caption = QLabel("1. Show this to your wallet's camera:")
         show_caption.setWordWrap(True)
-        self._qr_label = QRWidget(preferred_side=PANE)
+        self._qr_label = QRWidget(preferred_side=PANE, fill=QR_FILL)
         grid.addWidget(show_caption, 0, 0, top)
         grid.addWidget(_view_framed(self._qr_label), 1, 0)
 
