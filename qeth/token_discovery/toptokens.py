@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import cast
 
 from .. import USER_AGENT
+from ..address import tron_to_hex
 from ..fsatomic import atomic_write_text
 
 log = logging.getLogger("qeth.token_discovery.toptokens")
@@ -46,6 +47,7 @@ COINGECKO_PLATFORMS: dict[int, str] = {
     100:   "xdai",
     56:    "binance-smart-chain",
     4663:  "robinhood",
+    728126428: "tron",     # platform addresses are base58 T… — converted below
 }
 
 _MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
@@ -134,6 +136,8 @@ def fetch_top_tokens(
         sym = symbols.get(coin_id, "")
         for cid, slug in slugs.items():
             addr = plats.get(slug)
+            if isinstance(addr, str) and not addr.startswith("0x"):
+                addr = tron_to_hex(addr)
             if isinstance(addr, str) and addr.startswith("0x") and len(addr) == 42:
                 out[cid].append(TopToken(address=addr.lower(), symbol=sym))
     return out
@@ -191,12 +195,18 @@ class TopTokens:
         return self._cache_dir / "top_tokens.json"
 
     def _load(self) -> None:
-        # Prefer the runtime cache; fall back to the bundled seed.
-        for path in (self._cache_path(), self._seed_path):
-            parsed = self._read(path)
-            if parsed is not None:
-                self._by_chain, self._fetched_at = parsed
-                return
+        # Prefer the runtime cache; fall back to the bundled seed — per CHAIN,
+        # so a network added after the cache was last refreshed (Tron) still
+        # gets the seed's head until the next refresh covers it, instead of
+        # nothing for up to a TTL.
+        cache = self._read(self._cache_path())
+        seed = self._read(self._seed_path)
+        if cache is not None:
+            self._by_chain, self._fetched_at = cache
+            for cid, addrs in (seed[0] if seed is not None else {}).items():
+                self._by_chain.setdefault(cid, addrs)
+        elif seed is not None:
+            self._by_chain, self._fetched_at = seed
 
     @staticmethod
     def _read(path: Path) -> tuple[dict[int, list[str]], float] | None:

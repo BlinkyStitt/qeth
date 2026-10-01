@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from dataclasses import fields
 from pathlib import Path
 
-from .chains import Chain, DEFAULT_CHAINS
+from .chains import DEFAULT_CHAINS, EVM, FAMILIES, Chain
 from .fsatomic import atomic_write_text
 
 
@@ -103,6 +103,18 @@ def _assign_tree_ids(accounts: list[dict], tree_labels: dict[str, str]) -> None:
                 tree_labels[key] = _default_tree_label(a["address"])
 
 
+def account_families(account: dict) -> frozenset[str]:
+    """The chain families an account record works on. A hot wallet holds a
+    raw secp256k1 key, and one key is one address body on EVM and Tron alike,
+    so it serves both. Every other record is tied to one family — a device
+    account by its derivation path (coin type 60 vs 195), a watch-only one by
+    the address form it was added with — stored as ``family``, absent = EVM
+    (every record predating Tron)."""
+    if account.get("source") == "hot":
+        return frozenset(FAMILIES)
+    return frozenset((account.get("family") or EVM,))
+
+
 CONFIG_DIR = Path.home() / ".qeth"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
@@ -135,8 +147,10 @@ class Store:
         self._io_lock = threading.Lock()
         self._save_seq = 0
         self._last_written_seq = 0
-        # {address, path, source, scheme, label, tree?} — ``tree`` (grouped
-        # sources only) is the per-device subtree id; see _assign_tree_ids.
+        # {address, path, source, scheme, label, tree?, family?} — ``tree``
+        # (grouped sources only) is the per-device subtree id; see
+        # _assign_tree_ids. ``family`` is set on non-EVM records only; see
+        # account_families. ``address`` is always the 0x hex form (qeth.address).
         self.accounts: list[dict] = []
         # Display order of the top-level account branches (source keys, e.g.
         # ["qr", "ledger", …]). Empty = the built-in default order. The tree
@@ -150,12 +164,20 @@ class Store:
         self.tree_labels: dict[str, str] = {}
         self.chains: list[Chain] = list(DEFAULT_CHAINS)
         self.current_chain_id: int = 1
+        # The last EVM chain the user picked. Dapps speak EIP-1193 only, so
+        # while the UI is on a non-EVM chain (Tron) they keep seeing this one.
+        self.dapp_chain_id: int = 1
         self.default_account: str | None = None
         # The default account's derivation path — its record identity together
         # with default_account. Disambiguates the signer when the same address
         # is held by two signers (Ledger + Air-gapped): connecting the QR row
         # must sign via QR, the Ledger row via Ledger.
         self.default_account_path: str | None = None
+        # The connected account of each NON-EVM family, {family: {"address",
+        # "path"}} — Tron's own "default for dapps", set by double-click /
+        # Connect on a Tron view. Separate from default_account, which is what
+        # EVM dapps get from eth_accounts and must stay an EVM account.
+        self.family_defaults: dict[str, dict[str, str | None]] = {}
         # User overrides for the token panel: (chain_id, addr_lower) tuples.
         # `hidden` always wins over `shown` when both contain the same key.
         self.hidden_tokens: set[tuple[int, str]] = set()
@@ -224,8 +246,16 @@ class Store:
             # Idempotent; persists on the next save (like the chain forward-fill).
             _assign_tree_ids(s.accounts, s.tree_labels)
             s.current_chain_id = data.get("current_chain_id", 1)
+            # Older configs have no dapp chain: every chain they could be on
+            # was EVM, so it's the current one.
+            s.dapp_chain_id = data.get("dapp_chain_id", s.current_chain_id)
             s.default_account = data.get("default_account")
             s.default_account_path = data.get("default_account_path")
+            fd = data.get("family_defaults")
+            if isinstance(fd, dict):
+                s.family_defaults = {
+                    fam: {"address": v.get("address"), "path": v.get("path")}
+                    for fam, v in fd.items() if isinstance(v, dict)}
             chains_data = data.get("chains")
             if chains_data:
                 s.chains = [_merge_chain(c) for c in chains_data]
@@ -302,8 +332,10 @@ class Store:
                 "tree_labels": dict(self.tree_labels),
                 "chains": [c.to_dict() for c in self.chains],
                 "current_chain_id": self.current_chain_id,
+                "dapp_chain_id": self.dapp_chain_id,
                 "default_account": self.default_account,
                 "default_account_path": self.default_account_path,
+                "family_defaults": {f: dict(v) for f, v in self.family_defaults.items()},
                 "hidden_tokens": [
                     {"chain_id": cid, "address": addr}
                     for (cid, addr) in sorted(self.hidden_tokens)
@@ -351,8 +383,11 @@ class Store:
                 if a["address"].lower() == addr and a.get("path", "") == path:
                     return False
             self.accounts.append(account)
-            if self.default_account is None:
-                self.default_account = account["address"]
+            # Each family's first account becomes its default — for EVM that
+            # is what dapps get from eth_accounts, so only an EVM account.
+            for family in account_families(account):
+                if self.default_for(family)[0] is None:
+                    self._set_default_locked(account["address"], None, family)
         self.save()
         return True
 
@@ -376,17 +411,20 @@ class Store:
                             and a.get("path", "") == path)]
             if len(self.accounts) == before:
                 return False
-            still_has_addr = any(a["address"].lower() == addr for a in self.accounts)
-            if self.default_account and self.default_account.lower() == addr:
-                if still_has_addr:
+            for family in FAMILIES:
+                default, dpath = self.default_for(family)
+                if not default or default.lower() != addr:
+                    continue
+                if any(a["address"].lower() == addr
+                       and family in account_families(a) for a in self.accounts):
                     # The address survives in another branch — keep it as the
                     # default, but drop a now-stale connected-record path.
-                    if self.default_account_path == path:
-                        self.default_account_path = None
+                    if dpath == path:
+                        self._set_default_locked(default, None, family)
                 else:
-                    self.default_account = (
-                        self.accounts[0]["address"] if self.accounts else None)
-                    self.default_account_path = None
+                    self._set_default_locked(next(
+                        (a["address"] for a in self.accounts
+                         if family in account_families(a)), None), None, family)
             # Drop tree labels whose tree no longer has any account (removing a
             # whole device's last account retires its label); a sibling tree in
             # the same source keeps its own.
@@ -404,9 +442,29 @@ class Store:
                     return c
             return self.chains[0]
 
+    def dapp_chain(self) -> Chain:
+        """The chain dapps see by default: the current chain when it's EVM,
+        else the last EVM chain the user was on."""
+        with self._lock:
+            cur = self.current_chain()
+            if cur.is_evm:
+                return cur
+            for c in self.chains:
+                if c.chain_id == self.dapp_chain_id and c.is_evm:
+                    return c
+            return next((c for c in self.chains if c.is_evm), cur)
+
+    def accounts_for(self, family: str) -> list[dict]:
+        """The account records usable on chains of ``family``, in store
+        order."""
+        with self._lock:
+            return [a for a in self.accounts if family in account_families(a)]
+
     def set_current_chain(self, chain_id: int, *, persist: bool = True) -> None:
         with self._lock:
             self.current_chain_id = chain_id
+            if any(c.chain_id == chain_id and c.is_evm for c in self.chains):
+                self.dapp_chain_id = chain_id
         if persist:
             self.save()
 
@@ -533,34 +591,59 @@ class Store:
             self.save()
         return changed
 
-    def set_default_account(self, address: str, path: str | None = None) -> None:
-        """Set the connected/default account. ``path`` records WHICH record it is
-        when the same address is held by two signers, so signing routes to the
-        right one; ``None`` leaves it ambiguous (first record with the address)."""
+    def set_default_account(self, address: str, path: str | None = None,
+                            family: str = EVM) -> None:
+        """Set the connected/default account of ``family`` (EVM: the one dapps
+        get from eth_accounts). ``path`` records WHICH record it is when the
+        same address is held by two signers, so signing routes to the right
+        one; ``None`` leaves it ambiguous (first record with the address)."""
         with self._lock:
-            self.default_account = address
-            self.default_account_path = path
+            self._set_default_locked(address, path, family)
         self.save()
 
-    def account_for_signing(self, address: str, path: str | None = None) -> dict | None:
+    def default_for(self, family: str) -> tuple[str | None, str | None]:
+        """``(address, path)`` of ``family``'s connected account (or Nones)."""
+        with self._lock:
+            if family == EVM:
+                return self.default_account, self.default_account_path
+            d = self.family_defaults.get(family) or {}
+            return d.get("address"), d.get("path")
+
+    def _set_default_locked(self, address: str | None, path: str | None,
+                            family: str) -> None:
+        # Caller holds the lock.
+        if family == EVM:
+            self.default_account = address
+            self.default_account_path = path
+        elif address is None:
+            self.family_defaults.pop(family, None)
+        else:
+            self.family_defaults[family] = {"address": address, "path": path}
+
+    def account_for_signing(self, address: str, path: str | None = None,
+                            family: str | None = None) -> dict | None:
         """The account record to sign for ``address`` — disambiguated when the
         same address is held by two signers (Ledger + Air-gapped). Prefers an
         exact ``(address, path)``; else the connected default's remembered
-        record; else the first record with the address."""
+        record; else the first record with the address. ``family`` limits
+        the choice to records usable on that chain family (a Tron send must
+        not pick the same address's EVM-only Ledger record)."""
         al = address.lower()
+        pool = [a for a in self.accounts
+                if family is None or family in account_families(a)]
 
         def match(p: str) -> dict | None:
-            return next((a for a in self.accounts
+            return next((a for a in pool
                          if a["address"].lower() == al and a.get("path", "") == p),
                         None)
 
         if path is not None and (hit := match(path)) is not None:
             return hit
-        if (self.default_account and al == self.default_account.lower()
-                and self.default_account_path is not None
-                and (hit := match(self.default_account_path)) is not None):
+        default, dpath = self.default_for(family or EVM)
+        if (default and al == default.lower() and dpath is not None
+                and (hit := match(dpath)) is not None):
             return hit
-        return next((a for a in self.accounts if a["address"].lower() == al), None)
+        return next((a for a in pool if a["address"].lower() == al), None)
 
     def add_chain(self, chain: Chain) -> None:
         with self._lock:

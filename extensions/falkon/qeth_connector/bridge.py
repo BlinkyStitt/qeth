@@ -27,8 +27,9 @@
 
 import json
 import logging
+import os
 
-from PySide6.QtCore import QByteArray, QObject, QUrl, Signal, Slot
+from PySide6.QtCore import QByteArray, QObject, QTimer, QUrl, Signal, Slot
 from PySide6.QtNetwork import (
     QNetworkAccessManager, QNetworkReply, QNetworkRequest,
 )
@@ -36,6 +37,50 @@ from PySide6.QtNetwork import (
 log = logging.getLogger("qeth.falkon.bridge")
 
 _ENDPOINT = "http://127.0.0.1:1248/"
+
+# The bundled TronWeb (the unmodified npm dist — see tronweb/SOURCE.txt), run
+# on demand in a frame whose page uses Tron (provider.js).
+_TRONWEB = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "tronweb", "TronWeb.js")
+# QWebEngineScript.ScriptWorldId: the page's own world, and Falkon's
+# SafeJsWorld (ApplicationWorld), where relay.js runs.
+_MAIN_WORLD = 0
+_SAFE_WORLD = 1
+# How long the frame-finding probe may take before loadTronWeb gives up.
+_PROBE_TIMEOUT_MS = 5000
+
+
+def _origin_of(url):
+    """``scheme://host[:port]`` of a QUrl — ``window.location.origin``'s form
+    (a default port is absent from both)."""
+    port = url.port()
+    return f"{url.scheme()}://{url.host()}" + (f":{port}" if port != -1 else "")
+
+
+def _frames(page):
+    """Every frame of ``page`` that can run a script: the whole frame tree on
+    Qt >= 6.8 (QWebEngineFrame), else the page itself — its main frame."""
+    main = getattr(page, "mainFrame", None)
+    if main is None:
+        return [page]
+    out, stack = [], [main()]
+    while stack:
+        frame = stack.pop()
+        out.append(frame)
+        stack.extend(frame.children())
+    return out
+
+
+def _web_views():
+    """Every open web view (Falkon's tabs are QWebEngineView subclasses).
+
+    The VIEWS, not their pages: PyFalkon ties a page's Python wrapper to its
+    view's, so once the view's wrapper is collected the page's reads as
+    "Internal C++ object … already deleted" — though the page lives on. So a
+    caller keeps the view referenced for as long as it uses the page."""
+    from PySide6.QtWebEngineWidgets import QWebEngineView
+    from PySide6.QtWidgets import QApplication
+    return [w for w in QApplication.allWidgets() if isinstance(w, QWebEngineView)]
 
 
 def _dapp_origin(origin):
@@ -53,11 +98,89 @@ class QethBridge(QObject):
     # cid, json-text — emitted for every reply, routed back to the frame
     # whose relay sent the request.
     message = Signal(str, str)
+    # cid, ok, error — the answer to loadTronWeb.
+    tronWebLoaded = Signal(str, bool, str)
 
-    def __init__(self, endpoint=_ENDPOINT, parent=None):
+    def __init__(self, endpoint=_ENDPOINT, parent=None, *,
+                 views=_web_views, tronweb_path=_TRONWEB):
         super().__init__(parent)
         self._endpoint = endpoint
         self._nam = QNetworkAccessManager(self)
+        self._views = views
+        self._tronweb_path = tronweb_path
+        self._tronweb_src = None
+
+    @Slot(str, str, str)
+    def loadTronWeb(self, cid, token, origin):
+        """Run TronWeb in the frame whose relay asked (it holds ``token`` in
+        the SafeJsWorld, which no page script can reach), in that frame's
+        main world. Native injection: the page's CSP doesn't apply. The
+        answer comes back as ``tronWebLoaded(cid, ok, error)`` — on EVERY
+        path: an exception escaping a web-channel slot is swallowed, and the
+        page would wait out its own timeout (a dapp's "connecting…" forever)."""
+        try:
+            self._load_tronweb(cid, token, origin)
+        except Exception as e:
+            log.exception("loading TronWeb failed")
+            self.tronWebLoaded.emit(cid, False, f"qeth couldn't load TronWeb: {e}")
+
+    def _candidate_frames(self, views, origin):
+        frames = []
+        for view in views:
+            try:
+                frames += [f for f in _frames(view.page())
+                           if not origin or _origin_of(f.url()) == origin]
+            except RuntimeError:
+                # A view or page Qt already deleted — Falkon keeps a closed
+                # tab's widgets until a later deleteLater.
+                continue
+        return frames
+
+    def _load_tronweb(self, cid, token, origin):
+        # The views stay referenced until the answer (see _web_views).
+        state = {"left": 0, "done": False, "views": self._views()}
+
+        def finish(ok, msg=""):
+            if not state["done"]:
+                state["done"] = True
+                state["views"] = []
+                self.tronWebLoaded.emit(cid, ok, msg)
+
+        if self._tronweb_src is None:
+            try:
+                with open(self._tronweb_path, encoding="utf-8") as f:
+                    self._tronweb_src = f.read()
+            except OSError as e:
+                log.warning("TronWeb bundle unreadable: %s", e)
+                return finish(False, "TronWeb is missing from the qeth connector")
+        src = self._tronweb_src
+        probe = "window.__qethTronToken === " + json.dumps(token)
+
+        def answered(frame, result):
+            state["left"] -= 1
+            if state["done"]:
+                return
+            if result is True:
+                try:
+                    frame.runJavaScript(src, _MAIN_WORLD, lambda _r: finish(True))
+                except RuntimeError:
+                    finish(False, "the page asking for Tron went away")
+            elif state["left"] == 0:
+                # A sub-frame on Qt < 6.8 (no frame tree to search).
+                finish(False, "qeth can't load Tron into this frame under Falkon")
+
+        for frame in self._candidate_frames(state["views"], origin):
+            try:
+                frame.runJavaScript(probe, _SAFE_WORLD,
+                                    lambda r, fr=frame: answered(fr, r))
+            except RuntimeError:       # deleted between listing and probing
+                continue
+            state["left"] += 1
+        if not state["left"]:
+            return finish(False, "qeth couldn't find the page asking for Tron")
+        # A frame torn down mid-probe never calls back; don't let that hang.
+        QTimer.singleShot(_PROBE_TIMEOUT_MS, lambda: finish(
+            False, "qeth couldn't find the page asking for Tron"))
 
     @Slot(str, str, str)
     def send(self, cid, origin, text):

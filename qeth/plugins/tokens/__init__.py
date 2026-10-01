@@ -40,7 +40,8 @@ from PySide6.QtWidgets import (
 from ... import QULONGLONG
 from ...dialog import prompt_text
 from ...alerts import warn
-from ...chain import EthClient, wei_to_ether
+from ...chain import EthClient, native_amount
+from ...explorer import explorer_url
 from ...formatting import format_balance as _format_balance
 from ...formatting import format_usd as _format_usd
 from ...formatting import transfer_notice
@@ -57,7 +58,7 @@ from ...token_metadata import TokenMetadataCache
 from ...token_discovery import (
     COINGECKO_PLATFORMS, BlockscoutSource, EtherscanV2Source,
     RoutedTokenSource, TokenBalance, TokenListEntry, TokenLists, TokenSource,
-    TopTokens,
+    TopTokens, TronGridSource,
 )
 from .balance_ledger import BalanceLedger
 from .wallet_cache import CachedToken, CachedWallet, WalletCache
@@ -441,11 +442,16 @@ class TokensPlugin(Plugin):
         # chains it serves. Both lookups consult the store at
         # call time so changes to the key take effect on the very
         # next refresh without re-instantiating either source.
-        self._token_source = RoutedTokenSource(
-            EtherscanV2Source(lambda: self._store.etherscan_api_key),
-            BlockscoutSource(),
-        )
         self._token_lists = TokenLists()
+        # Tron has neither explorer: its holdings come from TronGrid, routed
+        # to only when the EVM pair doesn't support the chain.
+        self._token_source = RoutedTokenSource(
+            RoutedTokenSource(
+                EtherscanV2Source(lambda: self._store.etherscan_api_key),
+                BlockscoutSource(),
+            ),
+            TronGridSource(self._token_lists.get),
+        )
         # Top-tokens-by-market-cap head: a bounded set we always multicall
         # balanceOf over, so a held major shows even when the indexer's
         # per-holder list omits it (Blockscout has been observed to drop a
@@ -642,7 +648,7 @@ class TokensPlugin(Plugin):
                 "is_native": True,
                 "contract": None,
                 "symbol": chain.symbol,
-                "decimals": 18,
+                "decimals": chain.native_decimals,
                 "balance_raw": cached.native_balance_wei if cached else 0,
                 "logo_uri": None,
             }
@@ -683,11 +689,9 @@ class TokensPlugin(Plugin):
             return
         chain = self.host.current_chain()
         addr = self.host.selected_address
-        if not chain.explorer or not addr:
-            return
-        base = chain.explorer.rstrip("/")
-        url = f"{base}/token/{contract}?a={addr}"
-        QDesktopServices.openUrl(QUrl(url))
+        url = explorer_url(chain, "token", contract, ref_addr=addr)
+        if url and addr:
+            QDesktopServices.openUrl(QUrl(url))
 
     def focus_widget(self):
         return getattr(self._panel, "table", None)
@@ -1155,7 +1159,7 @@ class TokensPlugin(Plugin):
         self._last_native_seen[key] = native_wei
         if prev is None or native_wei <= prev:
             return
-        amount = _format_balance(wei_to_ether(native_wei - prev))
+        amount = _format_balance(native_amount(native_wei - prev, chain))
         title, body = transfer_notice(
             False, amount, chain.symbol, chain_name=chain.name)
         icon = notification_icon(bundled_native_icon(chain.symbol), False)
@@ -1544,9 +1548,9 @@ class TokensPlugin(Plugin):
     def _refresh(self, address: str) -> None:
         if self.host is None or self._panel is None:
             return
-        # Captured non-None aliases for the nested worker closures below;
+        # Captured non-None alias for the nested worker closures below;
         # mypy doesn't carry the guard's narrowing into inner scopes.
-        host, panel = self.host, self._panel
+        host = self.host
         chain = self.host.current_chain()
         self._maybe_scan_own_tokens(chain)
         self._maybe_scan_own_vaults(chain)
@@ -1821,17 +1825,22 @@ class TokensPlugin(Plugin):
             # directly, so a held USDC shows even with the indexer down.
             # on_discovered drives the in-flight guard to completion via
             # _on_combined_ready, so we DON'T discard it here.
-            if self._top_tokens.contracts(chain.chain_id):
-                log.warning("token discovery source failed (%s); falling "
-                            "back to top-N multicall for %s", msg, address)
-                on_discovered(0, [])
-                return
-            self._discovery_in_flight.discard(view_key)
-            # Nothing to fall back to (chain has no top-N): surface the
-            # error so the empty panel isn't mistaken for "no tokens".
-            if self._displayed_view == view_key:
-                panel.show_error(msg)
-            log.warning("token discovery failed for %s: %s", address, msg)
+            #
+            # Even with no top-N head for the chain (Tron's isn't seeded
+            # until the first CoinGecko refresh lands) the pass still reads
+            # the native balance and every contract already known — pinned,
+            # custom, own-history, cached — so the account never shows as
+            # empty just because the indexer is down or rate-limiting (keyless
+            # TronGrid 429s bursts). The status bar says the list may be short.
+            log.warning("token discovery failed for %s (%s); falling back to "
+                        "a direct balance read", address, msg)
+            if (not self._top_tokens.contracts(chain.chain_id)
+                    and self.host is not None
+                    and self._displayed_view == view_key):
+                self.host.status_message(
+                    f"Couldn't list this account's tokens ({msg}) — showing "
+                    "the balances qeth already knows about", 8000)
+            on_discovered(0, [])
 
         worker = TokenListWorker(
             chain, address, self._token_source, self._token_lists, self._store,
@@ -2776,7 +2785,7 @@ class TokenListPanel(QWidget):
         self._lp_coins = {}
 
         # --- native row ---------------------------------------------------
-        native_balance = wei_to_ether(native_wei)
+        native_balance = native_amount(native_wei, chain)
         self._balances[(chain.chain_id, self.NATIVE_CONTRACT)] = native_balance
         # Remembered so a chain-icon-ready signal can fill the native row's
         # icon later (the cache fetch is async).
@@ -2992,7 +3001,7 @@ class TokenListPanel(QWidget):
         "fall back to show_balances rebuild" when contracts changed."""
         if not self.contract_set_matches(chain, tokens):
             return False
-        new_native = wei_to_ether(native_wei)
+        new_native = native_amount(native_wei, chain)
         by_addr = {b.contract.lower(): b for b in tokens}
 
         # First pass: collect what would change without mutating anything.

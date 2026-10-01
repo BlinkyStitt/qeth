@@ -14,6 +14,7 @@
 # is also serving the page provider.
 # ============================================================
 
+import html
 import os
 
 from PySide6.QtCore import Qt, QByteArray, QUrl
@@ -27,7 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from qeth_connector import probe
-from qeth_connector.probe import chain_name as _chain_name
+from qeth_connector.site import active_tab_origin
 
 _ENDPOINT = probe.ENDPOINT
 _DIR = os.path.dirname(os.path.abspath(__file__))
@@ -130,6 +131,7 @@ class StatusDialog(QDialog):
         self._recheck.setEnabled(False)
         self._chain = None
         self._account = None
+        self._wallet = None
         self._error = None
         self._set_icon("view-refresh", "content-loading",
                        fallback=QStyle.StandardPixmap.SP_BrowserReload)
@@ -144,7 +146,7 @@ class StatusDialog(QDialog):
         req.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader,
                       "application/json")
         req.setTransferTimeout(probe.REQUEST_TIMEOUT_MS)
-        reply = self._nam.post(req, QByteArray(probe.batch_body()))
+        reply = self._nam.post(req, QByteArray(probe.batch_body(active_tab_origin())))
         reply.finished.connect(lambda r=reply: self._done(r))
 
     def _done(self, reply):
@@ -157,6 +159,7 @@ class StatusDialog(QDialog):
             st = probe.parse_status(data)
             self._chain, self._account, self._error = (
                 st.chain, st.account, st.error)
+            self._wallet = st.wallet
         self._render()
 
     # --- render -------------------------------------------------------
@@ -167,14 +170,18 @@ class StatusDialog(QDialog):
             self._set_icon("network-transmit-receive", "dialog-ok-apply",
                            fallback=QStyle.StandardPixmap.SP_DialogApplyButton)
             self._status.setText("Connected to qeth")
-            account = self._account or "No account selected in qeth"
+            st = probe.Status(connected=True, chain=self._chain,
+                              account=self._account, wallet=self._wallet)
+            host, shown = probe.view(st)
             # Don't wrap the address — let the window widen to keep it on
             # one line (nicer than breaking a 0x… hash mid-line).
             self._detail.setWordWrap(False)
-            self._detail.setText(
-                f"Network: <b>{_chain_name(self._chain)}</b><br>"
-                f"Account: {account}"
-            )
+            lines = [f"Site: <b>{html.escape(host)}</b>"] if host else []
+            for network, account in shown:
+                lines.append(f"Network: <b>{html.escape(network)}</b>")
+                lines.append("Account: " + html.escape(
+                    account or "No account selected in qeth"))
+            self._detail.setText("<br>".join(lines))
         else:
             self._set_icon("network-offline", "dialog-warning",
                            fallback=QStyle.StandardPixmap.SP_MessageBoxWarning)

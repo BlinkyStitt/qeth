@@ -31,8 +31,10 @@ from .chains import Chain
 from .fsatomic import atomic_write_text
 from .signing import (
     MessageSigningRequest, Signer, SignerError, SigningRequest,
+    TronMessageSigningRequest, TronSigningRequest, TronTypedDataSigningRequest,
     TypedDataSigningRequest,
 )
+from .tron.tx import signature_v27
 
 
 log = logging.getLogger("qeth.hot_wallet")
@@ -309,6 +311,24 @@ class HotWalletSigner(Signer):
         signable = encode_typed_data(full_message=req.typed_data)
         signed = Account.sign_message(signable, private_key=priv)
         return self._extract_signature(signed)
+
+    def sign_tron(self, req: TronSigningRequest) -> bytes:
+        """A Tron transaction: the same key signs the 32-byte txid
+        (sha256 of raw_data) directly — no prefix, no RLP."""
+        priv = self._load_priv(req.from_addr)
+        from eth_keys import keys
+        sig = keys.PrivateKey(priv).sign_msg_hash(req.tx.txid())
+        return signature_v27(sig.to_bytes())
+
+    def sign_tron_message(
+        self, req: TronMessageSigningRequest | TronTypedDataSigningRequest,
+    ) -> bytes:
+        """A TronWeb message / TIP-712 signature over the digest the request
+        computes from its own content (``qeth.tron.messages``)."""
+        priv = self._load_priv(req.from_addr)
+        from eth_keys import keys
+        sig = keys.PrivateKey(priv).sign_msg_hash(req.digest())
+        return signature_v27(sig.to_bytes())
 
     @staticmethod
     def _extract_signature(signed) -> bytes:

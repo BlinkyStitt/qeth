@@ -190,18 +190,26 @@ def _install_sigint_shutdown(app, window, signal_module=signal) -> QTimer:
     Qt's event loop sits in C++ long enough that Python's default SIGINT
     handling isn't observed promptly. A 500 ms no-op QTimer gives the
     interpreter regular checkpoints, and the handler schedules
-    ``window.close()`` so closeEvent persists UI state before app shutdown.
+    ``window.close()`` so closeEvent persists UI state, then quits — also
+    when the window is hidden in the tray.
     The previous handler is restored on aboutToQuit. ``signal_module`` is
     injectable for testing."""
     previous_handler = signal_module.getsignal(signal_module.SIGINT)
     shutdown_requested = False
+
+    def shut_down() -> None:
+        window.close()
+        # Closing quits via quitOnLastWindowClosed only when the window was on
+        # screen; hidden in the tray it closes nothing visible, so the app
+        # kept running and every further Ctrl+C was swallowed.
+        app.quit()
 
     def request_shutdown(_signum, _frame) -> None:
         nonlocal shutdown_requested
         if shutdown_requested:
             return
         shutdown_requested = True
-        QTimer.singleShot(0, window.close)
+        QTimer.singleShot(0, shut_down)
 
     def restore_handler() -> None:
         signal_module.signal(signal_module.SIGINT, previous_handler)

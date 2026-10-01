@@ -104,6 +104,7 @@ chrome.runtime.onConnect.addListener(function (port) {
 function onPortMessage(port, msg) {
   if (!msg) return;
   if (msg.type === "ping") { connect(); return; }   // traffic keeps us awake
+  if (msg.type === "tronweb") { loadTronWeb(port); return; }
   if (msg.type !== "req" || !msg.payload) return;
   var payload = msg.payload;
   var wsId = nextId++;
@@ -140,6 +141,36 @@ function onPortGone(port) {
       }
       delete subs[sid];
     }
+  }
+}
+
+// --- TronWeb, on demand ---------------------------------------------
+// A frame's page started using Tron (provider.js): run the bundled TronWeb
+// (the unmodified npm dist) in THAT frame's main world. The scripting API
+// isn't bound by the page's CSP, and only pages that use Tron pay for ~1 MB
+// of script. Chrome targets the exact document (a navigation in between
+// can't receive it); Firefox has no documentId, so the frame.
+var TRONWEB_FILE = "tronweb/TronWeb.js";
+
+function loadTronWeb(port) {
+  function reply(ok, error) {
+    try { port.postMessage({ type: "tronweb", ok: ok, error: error || null }); } catch (e) {}
+  }
+  var s = port.sender || {};
+  if (!originOf(port) || !s.tab || s.tab.id == null) {
+    reply(false, "Tron is only available on http(s) pages");
+    return;
+  }
+  var target = { tabId: s.tab.id };
+  if (typeof s.documentId === "string") target.documentIds = [s.documentId];
+  else target.frameIds = [s.frameId || 0];
+  try {
+    chrome.scripting.executeScript({
+      target: target, world: "MAIN", files: [TRONWEB_FILE], injectImmediately: true,
+    }).then(function () { reply(true); },
+            function (e) { reply(false, String((e && e.message) || e)); });
+  } catch (e) {
+    reply(false, String((e && e.message) || e));
   }
 }
 
@@ -244,17 +275,22 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
 // eth_chainId / eth_accounts are sent origin-less (no __frameOrigin), so the
 // server answers for the wallet's default chain — the Falkon StatusDialog
 // semantics. Opening the popup also nudges a reconnect.
-function askLocal(method, cb) {
+function askLocal(method, cb, params) {
   if (!wsOpen || !ws) { cb(null); return; }
   var wsId = nextId++;
   pending[wsId] = { port: null, originalId: null, method: method, cb: cb };
-  try { ws.send(JSON.stringify({ jsonrpc: "2.0", id: wsId, method: method })); }
-  catch (e) { delete pending[wsId]; cb(null); }
+  try {
+    ws.send(JSON.stringify({ jsonrpc: "2.0", id: wsId, method: method,
+                             params: params || [] }));
+  } catch (e) { delete pending[wsId]; cb(null); }
 }
 
-function queryStatus(sendResponse) {
-  var res = { connected: true, chainId: null, account: null };
-  var left = 2, done = false;
+// qeth_status adds what the popup describes (the network selected in qeth and
+// its account; what the active tab's site is presented); a qeth without it
+// errors, and the popup falls back to eth_chainId / eth_accounts.
+function queryStatus(sendResponse, origin) {
+  var res = { connected: true, chainId: null, account: null, wallet: null };
+  var left = 3, done = false;
   function finish() { if (!done) { done = true; sendResponse(res); } }
   var t = setTimeout(finish, 2000);
   function got() { if (--left <= 0) { clearTimeout(t); finish(); } }
@@ -264,6 +300,10 @@ function queryStatus(sendResponse) {
   askLocal("eth_accounts", function (m) {
     if (m && m.result && m.result[0]) res.account = m.result[0]; got();
   });
+  askLocal("qeth_status", function (m) {
+    if (m && m.result && typeof m.result === "object") res.wallet = m.result;
+    got();
+  }, origin ? [{ origin: origin }] : []);
 }
 
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
@@ -271,7 +311,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   connect();
   var deadline = Date.now() + 1500;         // give a just-started socket a moment
   (function attempt() {
-    if (wsOpen) { queryStatus(sendResponse); return; }
+    if (wsOpen) { queryStatus(sendResponse, msg.origin); return; }
     if (Date.now() >= deadline) { sendResponse({ connected: false }); return; }
     setTimeout(attempt, 150);
   })();

@@ -43,6 +43,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import QThread
 
+from ...address import codec_for, parse_any
+from ...chains import EVM, TRON, Chain
+from ...tron.paths import PATH_SCHEMES as TRON_PATH_SCHEMES
+from ...store import account_families
 from ...alerts import confirm, error, info, warn
 from ...dialog import (
     Dialog, address_field_min_width, item_spacing, prompt_text,
@@ -96,7 +100,7 @@ _SECTIONS: list[tuple[str, str, str, bool]] = [
 def _ledger_scheme_label(name: str) -> str:
     """A Ledger scheme name suffixed with its full path template (``i`` = the
     address index) — ``Legacy (m/44'/60'/0'/i)``. Unknown name → unchanged."""
-    template = PATH_SCHEMES.get(name)
+    template = PATH_SCHEMES.get(name) or TRON_PATH_SCHEMES.get(name)
     return f"{name} (m/{template.format(i='i')})" if template else name
 
 
@@ -973,17 +977,21 @@ class WalletsPlugin(Plugin):
         ``(item, is_default)`` so the caller can track the default row; the
         caller adds it under the right parent."""
         addr = a["address"]
+        chain = self._store.current_chain()
         # Record-aware: mark only the CONNECTED record as default. When the
         # default's path is unknown (legacy config, never re-connected), fall
-        # back to matching by address so the marker still shows.
-        default = self._store.default_account
-        dpath = self._store.default_account_path
+        # back to matching by address so the marker still shows. Each family
+        # has its own connected account (a Tron view marks Tron's).
+        default, dpath = self._store.default_for(chain.family)
         is_default = (
             default is not None
             and addr.lower() == default.lower()
             and (dpath is None or dpath == a.get("path", ""))
         )
-        display = f"[{addr}]" if is_default else f" {addr} "
+        # The row shows the chain family's form (T… on Tron); the item data
+        # keeps the internal 0x form every consumer keys on.
+        shown = codec_for(chain).display(addr)
+        display = f"[{shown}]" if is_default else f" {shown} "
         label_text = self._effective_label(addr)
         it = QTreeWidgetItem([display])
         it.setData(0, Qt.ItemDataRole.UserRole, addr)
@@ -1011,6 +1019,51 @@ class WalletsPlugin(Plugin):
         seen = {s[0] for s in ordered}
         ordered.extend(s for s in _SECTIONS if s[0] not in seen)
         return ordered
+
+    def _first_account_item(self) -> QTreeWidgetItem | None:
+        """The topmost account leaf in the tree, or None if it lists none."""
+        assert self._tree is not None
+        it = self._tree.topLevelItem(0)
+        while it is not None:
+            if isinstance(it.data(0, Qt.ItemDataRole.UserRole), str):
+                return it
+            it = self._tree.itemBelow(it)
+        return None
+
+    def on_chain_changed(self) -> None:
+        """A chain switch can change the family (EVM ⇄ Tron), and with it which
+        accounts are listed and how their addresses read — rebuild."""
+        self._rebuild_tree()
+
+    def _reveal_added(self, accounts: list[dict]) -> str | None:
+        """Show just-added accounts. The tree lists only the current network's
+        family, so an account that doesn't work here (a Tron address added
+        from an Ethereum view, a Ledger account added from Tron) would vanish
+        on add — switch to a network of its family instead (Tron, or the last
+        EVM network), then select it. Returns the network switched to, if
+        any, for the caller's status message."""
+        if not accounts:
+            return None
+        switched: str | None = None
+        families = account_families(accounts[0])
+        if (self._store.current_chain().family not in families
+                and self.host is not None):
+            target = (self._store.dapp_chain() if EVM in families else
+                      next((c for c in self._store.chains
+                            if c.family in families), None))
+            if target is not None:
+                self.host.switch_chain(target.chain_id)
+                switched = target.name
+        self.select_address(accounts[0]["address"])
+        return switched
+
+    def _scan_chain(self) -> Chain | None:
+        """The chain an EVM device scan reads nonces from: the current one,
+        or — while viewing Tron, which has no nonces — the last EVM one."""
+        if self.host is None:
+            return None
+        chain = self.host.current_chain()
+        return chain if chain.is_evm else self._store.dapp_chain()
 
     def _rebuild_tree(self) -> None:
         if self._tree is None:
@@ -1059,6 +1112,11 @@ class WalletsPlugin(Plugin):
                 if got is not None:
                     default_item = got
             if not (prior_key and self._select_key(*prior_key)):
+                if default_item is None:
+                    # No connected account in view (a Tron view has none, and
+                    # a chain switch can hide the selected account): land on
+                    # the first account rather than on nothing.
+                    default_item = self._first_account_item()
                 if default_item is not None:
                     self._tree.setCurrentItem(default_item)
             # Capture the selection while every rebuilt row is still VISIBLE.
@@ -1096,7 +1154,11 @@ class WalletsPlugin(Plugin):
         branch's root is also a drop target for its address leaves, a GROUPED
         branch's isn't (its scheme subgroups are)."""
         assert self._tree is not None    # _rebuild_tree guards before calling
-        accts = [a for a in self._store.accounts if a.get("source") == source]
+        # Only the records usable on the selected chain's family: a Tron view
+        # lists hot wallets + Tron accounts, an EVM view hides the Tron ones.
+        family = self._store.current_chain().family
+        accts = [a for a in self._store.accounts
+                 if a.get("source") == source and family in account_families(a)]
         if not accts:
             return None
         root = QTreeWidgetItem([f"{label} ({len(accts)})"])
@@ -1205,19 +1267,23 @@ class WalletsPlugin(Plugin):
         # Skip only if THIS exact record is already connected — the same address
         # held by another signer (Ledger vs QR) is a different connection, so a
         # double-click there should switch to it.
-        if (self._store.default_account is not None
-                and addr.lower() == self._store.default_account.lower()
-                and (self._store.default_account_path or "") == path):
+        default, dpath = self._family_default()
+        if (default is not None and addr.lower() == default.lower()
+                and (dpath or "") == path):
             return
         self._set_default(addr, path)
 
     def _on_tree_enter_pressed(self, address: str) -> None:
         """Enter / Return on a focused account leaf: same as
         double-click → connect to browser."""
-        current = self._store.default_account
+        current = self._family_default()[0]
         if current is not None and address.lower() == current.lower():
             return
         self._set_default(address)
+
+    def _family_default(self) -> tuple[str | None, str | None]:
+        """The connected ``(address, path)`` of the family on screen."""
+        return self._store.default_for(self._store.current_chain().family)
 
     def _emit_address(self, addrs: list[str] | None = None) -> str | None:
         """The address a selection broadcast carries: the single selected KNOWN
@@ -1363,6 +1429,7 @@ class WalletsPlugin(Plugin):
             return
         needle = self._filter_text.strip().lower()
         filtering = bool(needle)
+        codec = codec_for(self._store.current_chain())
         # Snapshot the true collapse state on the empty→non-empty transition so
         # the forced expand below can be undone on clear.
         if filtering and self._pre_filter_expansion is None:
@@ -1376,6 +1443,7 @@ class WalletsPlugin(Plugin):
                 label = str(item.data(0, ACCOUNT_LABEL_ROLE) or "")
                 show = (force or not filtering
                         or needle in addr.lower()
+                        or needle in codec.display(addr).lower()   # T… on Tron
                         or needle in label.lower())
                 item.setHidden(not show)
                 return show
@@ -1423,7 +1491,12 @@ class WalletsPlugin(Plugin):
                 None,
             )
         is_watch = acct is not None and acct.get("source") == "watch_only"
-        is_default = single and addrs[0] == self._store.default_account
+        # Message signing (Sign) is EVM-only for now. Connect sets the
+        # connected account of the family on screen (Tron keeps its own).
+        evm = self._store.current_chain().is_evm
+        default = self._family_default()[0]
+        is_default = (single and default is not None
+                      and addrs[0].lower() == default.lower())
         # The Label action doubles as the device-tree rename: it's enabled for a
         # single account OR a single selected tree row (the other buttons stay
         # off for a tree row — it has no address to act on).
@@ -1432,15 +1505,17 @@ class WalletsPlugin(Plugin):
         self.act_remove.setEnabled(len(addrs) >= 1)
         self.act_qr.setEnabled(single)
         self.act_label.setEnabled(single or is_tree)
-        self.act_sign.setEnabled(single and not is_watch)
+        self.act_sign.setEnabled(single and not is_watch and evm)
         self.act_connect.setEnabled(single and not is_watch and not is_default)
         self.act_connect.setChecked(bool(is_default))
         if self._connect_btn is not None:
             self._connect_btn.setChecked(bool(is_default))
+            family = "" if evm else f"{self._store.current_chain().family.title()} "
             self._connect_btn.setToolTip(
                 "Watch-only — can't connect" if is_watch
-                else "Connected to browser" if is_default
-                else "Connect to browser (make default for dapps)"
+                else f"Connected — the default {family}account for dapps"
+                if is_default
+                else f"Connect to browser (make default for {family}dapps)"
             )
 
     def _on_tree_context_menu(self, pos) -> None:
@@ -1466,7 +1541,7 @@ class WalletsPlugin(Plugin):
             menu.addAction(self.act_qr)
             menu.addAction(self.act_label)
             addr = addrs[0]
-            default = self._store.default_account
+            default = self._family_default()[0]
             already_default = (
                 default is not None and addr.lower() == default.lower()
             )
@@ -1490,9 +1565,10 @@ class WalletsPlugin(Plugin):
         addrs = self.selected_addresses()
         if len(addrs) != 1:
             return
-        QApplication.clipboard().setText(addrs[0])
+        shown = codec_for(self._store.current_chain()).display(addrs[0])
+        QApplication.clipboard().setText(shown)
         if self.host is not None:
-            self.host.status_message(f"Copied {addrs[0]} to clipboard", 3000)
+            self.host.status_message(f"Copied {shown} to clipboard", 3000)
 
     def _remove_selected_account(self) -> None:
         if self._tree is None:
@@ -1598,7 +1674,7 @@ class WalletsPlugin(Plugin):
         if self.host is None:
             return
         dlg = AddLedgerDialog(
-            self.host.current_chain(), self._container,
+            self._scan_chain(), self._container,
             existing_addresses=self._addresses_for_source("ledger"))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1607,26 +1683,30 @@ class WalletsPlugin(Plugin):
         # Ledger), or start a new one anchored on the first added address.
         discovered = [(d.address, d.path) for d in dlg.discovered_accounts()]
         tid = self._store.resolve_tree("ledger", scheme, discovered)
-        added_addrs: list[str] = []
+        added: list[dict] = []
         for d in dlg.selected_accounts():
             if tid is None:
                 tid = d.address.lower()
-            if self._store.add_account({
+            record = {
                 "address": d.address,
                 "path": d.path,
                 "source": "ledger",
                 "scheme": scheme,
                 "tree": tid,
                 "label": "",
-            }):
-                added_addrs.append(d.address)
+            }
+            if self._store.add_account(record):
+                added.append(record)
+        added_addrs = [r["address"] for r in added]
         if added_addrs and tid is not None:
             self._store.ensure_tree_label("ledger", tid)
         self._rebuild_tree()
         self.default_account_changed.emit()
+        switched = self._reveal_added(added)
         if added_addrs and self.host is not None:
             self.host.status_message(
-                f"Added {len(added_addrs)} account(s)", 3000,
+                f"Added {len(added_addrs)} account(s)"
+                + (f" — switched to {switched}" if switched else ""), 3000,
             )
             # Async ENS reverse-lookup for each new address —
             # mirrors the Frame-import path. The wallet ships
@@ -1652,6 +1732,8 @@ class WalletsPlugin(Plugin):
         discovered = [(d.address, d.path) for d in dlg.discovered_accounts()]
         tid = self._store.resolve_tree("trezor", scheme, discovered, xfp=xfp)
         added_addrs: list[str] = []
+        tron = scheme in TRON_PATH_SCHEMES
+        added: list[dict] = []
         for d in dlg.selected_accounts():
             if tid is None:
                 tid = d.address.lower()
@@ -1663,18 +1745,24 @@ class WalletsPlugin(Plugin):
                 "tree": tid,
                 "label": "",
             }
+            if tron:
+                record["family"] = TRON
             if xfp:
                 record["xfp"] = xfp
             if self._store.add_account(record):
                 added_addrs.append(d.address)
+                added.append(record)
         if added_addrs and tid is not None:
             self._store.ensure_tree_label("trezor", tid)
         self._rebuild_tree()
         self.default_account_changed.emit()
+        switched = self._reveal_added(added)
         if added_addrs and self.host is not None:
             self.host.status_message(
-                f"Added {len(added_addrs)} account(s)", 3000)
-            self._kick_ens_label_lookups(added_addrs)
+                f"Added {len(added_addrs)} account(s)"
+                + (f" — switched to {switched}" if switched else ""), 3000)
+            if not tron:     # ENS names EVM addresses only
+                self._kick_ens_label_lookups(added_addrs)
 
     def _add_qr(self) -> None:
         """Import an air-gapped (QR) wallet: scan its account-export QR, derive
@@ -1694,7 +1782,7 @@ class WalletsPlugin(Plugin):
                  f"That doesn't look like a wallet account export.\n\n{e}")
             return
         dlg = AddQRWalletDialog(
-            account_key, self.host.current_chain(), self._container,
+            account_key, self._scan_chain(), self._container,
             existing_addresses=self._addresses_for_source("qr"))
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1705,10 +1793,11 @@ class WalletsPlugin(Plugin):
         discovered = [(d.address, d.path) for d in dlg.discovered_accounts()]
         tid = self._store.resolve_tree("qr", scheme, discovered, xfp=xfp)
         added_addrs: list[str] = []
+        added: list[dict] = []
         for d in dlg.selected_accounts():
             if tid is None:
                 tid = d.address.lower()
-            if self._store.add_account({
+            record = {
                 "address": d.address,
                 "path": d.path,
                 "source": "qr",
@@ -1716,15 +1805,19 @@ class WalletsPlugin(Plugin):
                 "xfp": xfp,
                 "tree": tid,
                 "label": "",
-            }):
+            }
+            if self._store.add_account(record):
                 added_addrs.append(d.address)
+                added.append(record)
         if added_addrs and tid is not None:
             self._store.ensure_tree_label("qr", tid)
         self._rebuild_tree()
         self.default_account_changed.emit()
+        switched = self._reveal_added(added)
         if added_addrs and self.host is not None:
             self.host.status_message(
-                f"Added {len(added_addrs)} account(s)", 3000)
+                f"Added {len(added_addrs)} account(s)"
+                + (f" — switched to {switched}" if switched else ""), 3000)
             self._kick_ens_label_lookups(added_addrs)
 
     def _add_hot_wallet(self) -> None:
@@ -1924,11 +2017,15 @@ class WalletsPlugin(Plugin):
         dlg = AddWatchOnlyDialog(existing, self._container)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        if self._store.add_account(dlg.result_account()):
+        account = dlg.result_account()
+        if self._store.add_account(account):
             self._rebuild_tree()
             self.default_account_changed.emit()
+            switched = self._reveal_added([account])
             if self.host is not None:
-                self.host.status_message("Watch-only address added", 3000)
+                self.host.status_message(
+                    "Watch-only address added"
+                    + (f" — switched to {switched}" if switched else ""), 5000)
 
     def _sign_selected(self) -> None:
         """Sign button → open the compose/sign flow for the selected
@@ -1955,7 +2052,7 @@ class WalletsPlugin(Plugin):
             return
         dlg = AccountInfoDialog(
             {**acct, "label": self._effective_label(addr)},
-            parent=self._container)
+            chain=self._store.current_chain(), parent=self._container)
         dlg.exec()
 
     def _edit_label(self) -> None:
@@ -2001,7 +2098,7 @@ class WalletsPlugin(Plugin):
         if not addr:
             self._update_account_buttons()
             return
-        default = self._store.default_account
+        default = self._family_default()[0]
         if default is not None and addr.lower() == default.lower():
             self._update_account_buttons()
             return
@@ -2026,7 +2123,10 @@ class WalletsPlugin(Plugin):
             key = self._selected_key()
             if key is not None and key[0] == address:
                 path = key[1]
-        self._store.set_default_account(address, path)
+        # The family on screen: a double-click on a Tron view connects the
+        # Tron account and leaves the EVM one (eth_accounts) alone.
+        self._store.set_default_account(
+            address, path, family=self._store.current_chain().family)
         self._rebuild_tree()
         self.default_account_changed.emit()
         # Re-run selection to refresh the details-panel button state.
@@ -2050,14 +2150,18 @@ class AccountInfoDialog(Dialog):
     the accounts panel's action row (the info used to sit in a
     permanent details panel below the tree)."""
 
-    def __init__(self, account: dict, parent=None):
+    def __init__(self, account: dict, chain: Chain | None = None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Account")
         v = QVBoxLayout(self)
+        # The address in the selected chain's form: receiving on Tron needs
+        # the T… address, which is what gets shown, copied and QR-encoded.
+        self._family = chain.family if chain is not None else EVM
+        shown = codec_for(self._family).display(account["address"])
 
         form = QFormLayout()
         mono = QFont("monospace")
-        self.address_lbl = QLabel(account["address"]); self.address_lbl.setFont(mono)
+        self.address_lbl = QLabel(shown); self.address_lbl.setFont(mono)
         self.address_lbl.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse)
         self.path_lbl = QLabel(account.get("path", "—")); self.path_lbl.setFont(mono)
@@ -2077,7 +2181,7 @@ class AccountInfoDialog(Dialog):
         self.qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.qr_lbl.setFixedSize(220, 220)
         v.addWidget(self.qr_lbl, 0, Qt.AlignmentFlag.AlignCenter)
-        self._render_qr(account["address"])
+        self._render_qr(shown)
 
         btns = QDialogButtonBox()
         copy_btn = btns.addButton("&Copy Address",
@@ -2085,14 +2189,16 @@ class AccountInfoDialog(Dialog):
         copy_btn.setIcon(QIcon.fromTheme("edit-copy"))
         close_btn = btns.addButton(QDialogButtonBox.StandardButton.Close)
         copy_btn.clicked.connect(
-            lambda: QApplication.clipboard().setText(account["address"]))
+            lambda: QApplication.clipboard().setText(shown))
         close_btn.clicked.connect(self.accept)
         v.addWidget(btns)
 
     def _render_qr(self, address: str) -> None:
         buf = io.BytesIO()
-        # ethereum: URI per EIP-681 so wallets recognize it as a send intent
-        segno.make(f"ethereum:{address}", error="m").save(
+        # ethereum: URI per EIP-681 so wallets recognize it as a send intent.
+        # Tron has no such URI scheme — its wallets scan the bare T… address.
+        payload = f"ethereum:{address}" if self._family == EVM else address
+        segno.make(payload, error="m").save(
             buf, kind="png", scale=6, border=2)
         pix = QPixmap()
         pix.loadFromData(buf.getvalue())  # format auto-detected from the PNG header
@@ -2232,12 +2338,15 @@ class AddLedgerDialog(Dialog):
         # still tick / untick to override.
         if acct.nonce == 0:
             usage = "unused"
+        elif acct.family != EVM:
+            usage = "used"          # Tron: activated (it has no nonce)
         elif acct.nonce == 1:
             usage = "1 tx"
         else:
             usage = f"{acct.nonce} txs"
         already = acct.address.lower() in self._existing
-        label = f"#{acct.index:<3} {acct.address}   {usage}"
+        shown = codec_for(acct.family).display(acct.address)
+        label = f"#{acct.index:<3} {shown}   {usage}"
         if already:
             label += "   (already added)"
         item = QListWidgetItem(label)
@@ -2260,7 +2369,7 @@ class AddLedgerDialog(Dialog):
         # before they tick which to add. Quietly drops if nothing
         # resolves. Skipped for already-added rows: they're in the wallet
         # already, with their own resolved label, and can't be re-added.
-        if not already:
+        if not already and acct.family == EVM:
             self._kick_ens_for_row(item, acct.address)
 
     def _kick_ens_for_row(self, item, address: str) -> None:
@@ -2354,9 +2463,13 @@ class AddTrezorDialog(AddLedgerDialog):
         self.setWindowTitle("Add Trezor Accounts")
         self.fingerprint = ""
         self._interaction = None
-        # BIP44 first — Trezor Suite's (and MetaMask's) layout.
+        # BIP44 first — Trezor Suite's (and MetaMask's) layout. On a Tron
+        # chain the Tron (coin type 195) schemes instead: adding from a Tron
+        # view means adding Tron accounts.
+        schemes = (TRON_PATH_SCHEMES if chain is not None and chain.family == TRON
+                   else TREZOR_SCHEMES)
         self.scheme_combo.clear()
-        for name in TREZOR_SCHEMES:
+        for name in schemes:
             self.scheme_combo.addItem(_ledger_scheme_label(name), name)
 
     def _scan(self) -> None:
@@ -2476,7 +2589,7 @@ class AddWatchOnlyDialog(Dialog):
         form = QFormLayout()
         self.address_edit = QLineEdit()
         self.address_edit.setPlaceholderText(
-            "0x… address or ENS name (e.g. vitalik.eth)")
+            "0x… or Tron T… address, or ENS name (e.g. vitalik.eth)")
         self.address_edit.setFont(QFont("monospace"))
         # Wide enough that a full 0x address shows without scrolling.
         self.address_edit.setMinimumWidth(address_field_min_width(self))
@@ -2530,14 +2643,15 @@ class AddWatchOnlyDialog(Dialog):
         checksum normalisation happens on accept (lower-case paste OK)."""
         text = self.address_edit.text().strip()
         self._ens_forward_addr = None
-        is_addr = text.startswith("0x") and len(text) == 42
-        if is_addr:
-            try:
-                int(text, 16)
-            except ValueError:
-                is_addr = False
+        parsed = parse_any(text)
+        is_addr = parsed is not None and parsed[0] == EVM
         is_name = "." in text and not text.startswith("0x") and len(text) >= 5
-        if is_addr:
+        if parsed is not None and parsed[0] != EVM:
+            # A Tron address: nothing for ENS to say about it.
+            self.add_btn.setEnabled(True)
+            self._set_resolved(None)
+            self._ens_timer.stop()
+        elif is_addr:
             self.add_btn.setEnabled(True)
             self._set_resolved(None)
             self._ens_timer.start()           # reverse → Label
@@ -2632,15 +2746,15 @@ class AddWatchOnlyDialog(Dialog):
             self.add_btn.setEnabled(False)
 
     def _on_accept(self) -> None:
-        from eth_utils import to_checksum_address
-        # An ENS name that forward-resolved → use the resolved address.
+        # An ENS name that forward-resolved → use the resolved address. The
+        # address form decides the family: a T… address watches on Tron.
         text = self._ens_forward_addr or self.address_edit.text().strip()
-        try:
-            checksum = to_checksum_address(text)
-        except Exception as e:
-            self.error_lbl.setText(f"Invalid address: {e}")
+        parsed = parse_any(text)
+        if parsed is None:
+            self.error_lbl.setText(f"Invalid address: {text}")
             self.error_lbl.setVisible(True)
             return
+        self._family, checksum = parsed
         if checksum.lower() in self._existing:
             self.error_lbl.setText(
                 "That address is already in the wallet."
@@ -2654,11 +2768,14 @@ class AddWatchOnlyDialog(Dialog):
     def result_account(self) -> dict:
         """The new account dict, ready to hand to Store.add_account.
         Call only after the dialog returned Accepted."""
-        return {
+        account = {
             "address": self._checksum,
             "source": "watch_only",
             "label": self._label,
         }
+        if self._family != EVM:
+            account["family"] = self._family
+        return account
 
 
 class AddHotWalletDialog(Dialog):

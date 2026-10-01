@@ -40,22 +40,56 @@ function setVersion() {
   catch (e) {}
 }
 
-function showConnected(chainId, account) {
+function networkName(chain) {
+  return (chain && chain.name) || chainName(chain && chain.chainId);
+}
+
+// What to show (res.wallet = qeth_status): the active tab's site when it's
+// connected — each network it obtained an account on, with that account —
+// else the network selected in qeth and its account. Without qeth_status (an
+// older qeth), the EVM chain dapps get and its account.
+function view(res) {
+  var wallet = res.wallet || {};
+  var site = wallet.site;
+  if (site && site.connections && site.connections.length) {
+    var host = "";
+    try { host = new URL(site.origin).host; } catch (e) {}
+    return { host: host, shown: site.connections.map(function (c) {
+      return { network: networkName(c.chain), account: c.account };
+    }) };
+  }
+  if (wallet.chain) {
+    return { host: null, shown: [{ network: networkName(wallet.chain),
+                                   account: wallet.account }] };
+  }
+  return { host: null, shown: [{ network: chainName(res.chainId), account: res.account }] };
+}
+
+function showConnected(res) {
+  var v = view(res);
   $("status").className = "status ok";
   $("status").textContent = "Connected to qeth";
   var detail = $("detail");
   clear(detail);
-  detail.appendChild(text("Network: "));
-  detail.appendChild(el("b", chainName(chainId)));
-  detail.appendChild(document.createElement("br"));
-  detail.appendChild(text("Account: "));
-  if (account) {
-    var addr = el("span", account);
-    addr.className = "addr";
-    detail.appendChild(addr);
-  } else {
-    detail.appendChild(text("No account selected in qeth"));
+  if (v.host) {
+    detail.appendChild(text("Site: "));
+    detail.appendChild(el("b", v.host));
+    detail.appendChild(document.createElement("br"));
   }
+  v.shown.forEach(function (row, i) {
+    if (i) detail.appendChild(document.createElement("br"));
+    detail.appendChild(text("Network: "));
+    detail.appendChild(el("b", row.network));
+    detail.appendChild(document.createElement("br"));
+    detail.appendChild(text("Account: "));
+    if (row.account) {
+      var addr = el("span", row.account);
+      addr.className = "addr";
+      detail.appendChild(addr);
+    } else {
+      detail.appendChild(text("No account selected in qeth"));
+    }
+  });
 }
 
 function showDisconnected() {
@@ -70,13 +104,29 @@ function showDisconnected() {
   detail.appendChild(text(" — then press Recheck."));
 }
 
+// The active tab's http(s) origin, or null — the site the popup describes.
+function activeOrigin(cb) {
+  if (!chrome.tabs || !chrome.tabs.query) { cb(null); return; }
+  chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+    var url = tabs && tabs[0] && tabs[0].url;      // host permissions expose it
+    var origin = null;
+    try {
+      var u = new URL(url);
+      if (u.protocol === "http:" || u.protocol === "https:") origin = u.origin;
+    } catch (e) {}
+    cb(origin);
+  });
+}
+
 function probe() {
   $("status").className = "status off";
   $("status").textContent = "Checking…";
   $("detail").textContent = "";
-  chrome.runtime.sendMessage({ type: "status" }, function (res) {
-    if (chrome.runtime.lastError || !res || !res.connected) { showDisconnected(); return; }
-    showConnected(res.chainId, res.account);
+  activeOrigin(function (origin) {
+    chrome.runtime.sendMessage({ type: "status", origin: origin }, function (res) {
+      if (chrome.runtime.lastError || !res || !res.connected) { showDisconnected(); return; }
+      showConnected(res);
+    });
   });
 }
 

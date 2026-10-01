@@ -75,9 +75,10 @@ def test_font_is_a_noop_outside_flatpak(qtbot, tmp_path):
     assert app.font() == before
 
 
-def test_sigint_shutdown_closes_window_via_close_event(qtbot):
+def test_sigint_shutdown_closes_window_via_close_event(qtbot, monkeypatch):
     app = QApplication.instance()
     assert isinstance(app, QApplication)
+    monkeypatch.setattr(app, "quit", lambda: None)   # keep the shared test app
     fake_signal = _FakeSignalModule()
     closed: list[bool] = []
 
@@ -98,6 +99,39 @@ def test_sigint_shutdown_closes_window_via_close_event(qtbot):
         # Firing SIGINT schedules window.close() → closeEvent persists state.
         fake_signal.handler(fake_signal.SIGINT, None)
         qtbot.waitUntil(lambda: bool(closed) and not win.isVisible())
+    finally:
+        timer.stop()
+        timer.deleteLater()
+
+
+def test_sigint_shutdown_quits_when_the_window_is_in_the_tray(
+        qtbot, monkeypatch):
+    """Minimised to the tray the window is hidden, and closing a hidden window
+    never triggers quitOnLastWindowClosed — Ctrl+C left the app running (and
+    swallowed every further Ctrl+C). It must still persist state AND quit."""
+    app = QApplication.instance()
+    assert isinstance(app, QApplication)
+    quits: list[bool] = []
+    monkeypatch.setattr(app, "quit", lambda: quits.append(True))
+    fake_signal = _FakeSignalModule()
+    closed: list[bool] = []
+
+    class Window(QMainWindow):
+        def closeEvent(self, event):  # noqa: N802 - Qt override
+            closed.append(True)
+            super().closeEvent(event)
+
+    win = Window()
+    qtbot.addWidget(win)
+    win.show()
+    win.hide()                       # what the tray does on minimise
+
+    timer = _install_sigint_shutdown(app, win, signal_module=fake_signal)
+    try:
+        assert fake_signal.handler is not None
+        fake_signal.handler(fake_signal.SIGINT, None)
+        qtbot.waitUntil(lambda: bool(quits))
+        assert closed                # closeEvent still persisted the state
     finally:
         timer.stop()
         timer.deleteLater()

@@ -139,18 +139,256 @@ class TestProbe:
         import json
         p = self._probe()
         body = json.loads(p.batch_body())
-        assert [e["method"] for e in body] == ["eth_chainId", "eth_accounts"]
-        assert [e["id"] for e in body] == [1, 2]
+        assert [e["method"] for e in body] == ["eth_chainId", "eth_accounts",
+                                               "qeth_status"]
+        assert [e["id"] for e in body] == [1, 2, 3]
+        assert body[2]["params"] == []
+        body = json.loads(p.batch_body("https://sun.io"))
+        assert body[2]["params"] == [{"origin": "https://sun.io"}]
+
+    WALLET = {
+        "chain": {"chainId": "0x1", "name": "Ethereum", "family": "evm"},
+        "account": "0xABC",
+        "site": {"origin": "https://sun.io", "connections": [
+            {"chain": {"chainId": "0x2b6653dc", "name": "Tron", "family": "tron"},
+             "account": "TSzckeDYKoVyMhoh7jQ3kH9vLi5g5ZtfFL"}]},
+    }
+
+    def test_a_connected_site_shows_only_its_connection(self):
+        import json
+        p = self._probe()
+        st = p.parse_status(json.dumps([
+            {"id": 1, "result": "0x1"}, {"id": 2, "result": ["0xABC"]},
+            {"id": 3, "result": self.WALLET}]))
+        # qeth is on Ethereum, but sun.io is connected to Tron: show that.
+        assert p.view(st) == ("sun.io", [("Tron", "TSzckeDYKoVyMhoh7jQ3kH9vLi5g5ZtfFL")])
+        # A site that obtained nothing → what's selected in qeth.
+        unconnected = {**self.WALLET, "site": {"origin": "https://x.example",
+                                               "connections": []}}
+        st = p.parse_status(json.dumps([
+            {"id": 1, "result": "0x1"}, {"id": 2, "result": ["0xABC"]},
+            {"id": 3, "result": unconnected}]))
+        assert p.view(st) == (None, [("Ethereum", "0xABC")])
+
+    def test_an_older_qeth_falls_back_to_its_evm_chain(self):
+        import json
+        p = self._probe()
+        st = p.parse_status(json.dumps([
+            {"id": 1, "result": "0x1"}, {"id": 2, "result": ["0xABC"]},
+            {"id": 3, "error": {"code": -32601, "message": "no such method"}}]))
+        assert st.connected and st.error is None and st.wallet is None
+        assert p.view(st) == (None, [("Ethereum", "0xABC")])
+
+    def test_origin_of(self):
+        p = self._probe()
+        assert p.origin_of("https://sun.io/#/home?x=1") == "https://sun.io"
+        assert p.origin_of("http://localhost:3000/a") == "http://localhost:3000"
+        for other in ("falkon:speeddial", "about:blank", "file:///x", "", None):
+            assert p.origin_of(other) is None
+
+# --- TronWeb on demand (bridge.loadTronWeb) -------------------------------------
+
+class _Url:
+    def __init__(self, scheme, host, port=-1):
+        self._s, self._h, self._p = scheme, host, port
+
+    def scheme(self):
+        return self._s
+
+    def host(self):
+        return self._h
+
+    def port(self):
+        return self._p
 
 
-def test_bridge_forwards_only_http_origins():
-    # Finding C from the Frame Companion review: a file:// page's
-    # window.location.origin collapses to a shared "file://", so every local
-    # file would share one per-origin slot in qeth. Only http(s) origins are
-    # forwarded as the Origin header; everything else is origin-less.
-    bridge = _load_module("bridge.py")
-    assert bridge._dapp_origin("https://app.uniswap.org") == "https://app.uniswap.org"
-    assert bridge._dapp_origin("http://localhost:3000") == "http://localhost:3000"
-    for opaque in ("file://", "null", "", None, "chrome://x", "about:blank",
-                   "data:text/html,x"):
-        assert bridge._dapp_origin(opaque) == "", opaque
+class _Frame:
+    """A QWebEngineFrame stand-in: answers the token probe from its
+    SafeJsWorld "global", records what ran in the main world."""
+
+    def __init__(self, url, token=None, children=()):
+        self._url, self.token, self._children = url, token, list(children)
+        self.main_world: list[str] = []
+
+    def url(self):
+        return self._url
+
+    def children(self):
+        return self._children
+
+    def runJavaScript(self, src, world, callback):  # noqa: N802 — Qt's name
+        if world == 1:                                      # the relay's world
+            callback(src.endswith('"%s"' % self.token) if self.token else False)
+        else:
+            self.main_world.append(src)
+            callback(None)
+
+
+class _Page:
+    def __init__(self, main):
+        self._main = main
+
+    def mainFrame(self):  # noqa: N802
+        return self._main
+
+
+class _View:
+    def __init__(self, page):
+        self._page = page
+
+    def page(self):
+        return self._page
+
+
+def _tron_bridge(tmp_path, pages):
+    mod = _load_module("bridge.py")
+    tw = tmp_path / "TronWeb.js"
+    tw.write_text("/* tronweb */")
+    b = mod.QethBridge(views=lambda: [_View(p) for p in pages], tronweb_path=str(tw))
+    got = []
+    b.tronWebLoaded.connect(lambda cid, ok, err: got.append((cid, ok, err)))
+    return b, got
+
+
+def test_bridge_loads_tronweb_into_the_frame_holding_the_token(qapp, tmp_path):
+    origin = _Url("https", "dapp.example")
+    asking = _Frame(origin, token="tok")
+    bystander = _Frame(origin)                        # same origin, other frame
+    other_site = _Frame(_Url("https", "evil.example"), token="tok")
+    page = _Page(_Frame(origin, children=[bystander, asking]))
+    b, got = _tron_bridge(tmp_path, [page, _Page(other_site)])
+    b.loadTronWeb("cid", "tok", "https://dapp.example")
+    assert got == [("cid", True, "")]
+    assert asking.main_world == ["/* tronweb */"]
+    assert bystander.main_world == [] and other_site.main_world == []
+
+
+def test_bridge_reports_a_frame_it_cant_find(qapp, tmp_path):
+    b, got = _tron_bridge(tmp_path, [_Page(_Frame(_Url("https", "dapp.example")))])
+    b.loadTronWeb("cid", "tok", "https://dapp.example")
+    assert got and got[0][:2] == ("cid", False)
+    b.loadTronWeb("cid2", "tok", "https://nowhere.example")
+    assert got[1][:2] == ("cid2", False)
+
+
+def test_bridge_reports_a_missing_bundle(qapp, tmp_path):
+    mod = _load_module("bridge.py")
+    b = mod.QethBridge(views=lambda: [], tronweb_path=str(tmp_path / "nope.js"))
+    got = []
+    b.tronWebLoaded.connect(lambda cid, ok, err: got.append((cid, ok, err)))
+    b.loadTronWeb("cid", "tok", "")
+    assert got == [("cid", False, "TronWeb is missing from the qeth connector")]
+
+
+def test_origin_of_matches_window_location_origin():
+    mod = _load_module("bridge.py")
+    assert mod._origin_of(_Url("https", "a.example")) == "https://a.example"
+    assert mod._origin_of(_Url("http", "localhost", 3000)) == "http://localhost:3000"
+
+
+def test_falkon_relay_asks_the_bridge_with_a_private_token():
+    relay = (FALKON / "relay.js").read_text()
+    assert 'd.kind === "tronweb"' in relay
+    # The token lives in the SafeJsWorld, where no page script can set it.
+    assert "window.__qethTronToken = cidGen();" in relay
+    assert "bridge.loadTronWeb(cid, window.__qethTronToken" in relay
+    assert "bridge.tronWebLoaded.connect" in relay
+
+
+def test_falkon_ships_the_same_tronweb_as_the_extension():
+    webext = FALKON.parent.parent / "webext" / "tronweb"
+    for name in ("TronWeb.js", "TronWeb.js.LICENSE.txt", "LICENSE", "SOURCE.txt"):
+        assert (FALKON / "tronweb" / name).read_bytes() == (webext / name).read_bytes(), name
+
+
+class _DeadPage:
+    """A page whose C++ side Qt already deleted — what a real Falkon's view
+    list hands back for a replaced page / a closed tab awaiting deleteLater."""
+
+    def mainFrame(self):  # noqa: N802
+        raise RuntimeError(
+            "libshiboken: Internal C++ object (PyFalkon.WebPage) already deleted.")
+
+
+def test_bridge_skips_pages_qt_already_deleted(qapp, tmp_path):
+    """The real-Falkon failure: one dead page made loadTronWeb raise — and an
+    exception in a web-channel slot is swallowed, so the dapp spun forever."""
+    asking = _Frame(_Url("https", "sun.io"), token="tok")
+    b, got = _tron_bridge(tmp_path, [_DeadPage(), _Page(asking)])
+    b.loadTronWeb("cid", "tok", "https://sun.io")
+    assert got == [("cid", True, "")] and asking.main_world == ["/* tronweb */"]
+
+
+class _SilentFrame(_Frame):
+    def runJavaScript(self, src, world, callback):  # noqa: N802
+        pass                                        # torn down: never calls back
+
+
+def test_bridge_answers_even_when_a_frame_never_does(qtbot, tmp_path):
+    mod = _load_module("bridge.py")
+    mod._PROBE_TIMEOUT_MS = 50
+    tw = tmp_path / "TronWeb.js"
+    tw.write_text("x")
+    page = _Page(_SilentFrame(_Url("https", "sun.io")))
+    b = mod.QethBridge(views=lambda: [_View(page)], tronweb_path=str(tw))
+    got = []
+    b.tronWebLoaded.connect(lambda cid, ok, err: got.append((cid, ok)))
+    b.loadTronWeb("cid", "tok", "https://sun.io")
+    qtbot.waitUntil(lambda: got == [("cid", False)], timeout=2000)
+
+
+def test_bridge_turns_any_error_into_an_answer(qapp, tmp_path):
+    def boom():
+        raise ValueError("surprise")
+    mod = _load_module("bridge.py")
+    tw = tmp_path / "TronWeb.js"
+    tw.write_text("x")
+    b = mod.QethBridge(views=boom, tronweb_path=str(tw))
+    got = []
+    b.tronWebLoaded.connect(lambda cid, ok, err: got.append((cid, ok, err)))
+    b.loadTronWeb("cid", "tok", "")
+    assert got == [("cid", False, "qeth couldn't load TronWeb: surprise")]
+
+
+class _LateFrame(_Frame):
+    """Answers the token probe LATER (as QtWebEngine does), and — PyFalkon's
+    quirk — reads as deleted once its view's wrapper has been collected."""
+
+    def __init__(self, url, token):
+        super().__init__(url, token)
+        self.pending: list = []
+        self.view = None
+
+    def runJavaScript(self, src, world, callback):  # noqa: N802
+        if self.view() is None:
+            raise RuntimeError("Internal C++ object (PyFalkon.WebPage) already deleted.")
+        if world == 1:
+            self.pending.append(lambda: callback(src.endswith('"%s"' % self.token)))
+        else:
+            self.main_world.append(src)
+            callback(None)
+
+
+def test_bridge_keeps_the_views_alive_until_it_answers(qapp, tmp_path):
+    """The live-Falkon bug: holding only the PAGES let their views' wrappers be
+    collected, which killed the page wrappers mid-load."""
+    import gc
+    import weakref
+    mod = _load_module("bridge.py")
+    tw = tmp_path / "TronWeb.js"
+    tw.write_text("x")
+    frame = _LateFrame(_Url("https", "sun.io"), token="tok")
+
+    def views():
+        view = _View(_Page(frame))
+        frame.view = weakref.ref(view)
+        return [view]
+    b = mod.QethBridge(views=views, tronweb_path=str(tw))
+    got = []
+    b.tronWebLoaded.connect(lambda cid, ok, err: got.append((cid, ok, err)))
+    b.loadTronWeb("cid", "tok", "https://sun.io")
+    gc.collect()                      # nothing but the bridge holds the view now
+    frame.pending.pop()()             # the probe's answer arrives
+    assert got == [("cid", True, "")] and frame.main_world == ["x"]
+    gc.collect()                      # …and it lets go once it has answered
+    assert frame.view() is None

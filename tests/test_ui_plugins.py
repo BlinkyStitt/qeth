@@ -1219,6 +1219,92 @@ class TestTransactionsPlugin:
         assert "unverified contract — selector only" in text
         assert "transfer(address,uint256)" not in text
 
+    def _batch_details_dialog(self, source, started):
+        """A details dialog whose ABI source is ``source``; only the per-target
+        ABI fetches are started (collected in ``started``), so nothing else in
+        the dialog reaches the network."""
+        from unittest.mock import MagicMock
+        from qeth.plugins.transactions import (
+            AbiFetchWorker, TransactionDetailsDialog)
+
+        def start_worker(worker):
+            if isinstance(worker, AbiFetchWorker):
+                started.append(worker)
+                worker.start()
+
+        tx = Transaction(
+            chain_id=1, hash="0x" + "cc" * 32, block_number=1,
+            timestamp=1779618611, nonce=1, from_addr=ADDR,
+            to_addr="0x" + "22" * 20, value_wei=0, gas_used=21000,
+            gas_price_wei=10**9, method_id="", input_data="0x", success=True,
+        )
+        cache = MagicMock()
+        cache.load.return_value = None          # nothing cached, ever
+        return TransactionDetailsDialog(
+            tx, ETH, abi_source=source, abi_cache=cache,
+            start_worker=start_worker, token_info=lambda *a: None,
+            icon_cache=MagicMock(), native_price_usd=None,
+        )
+
+    def test_failed_batch_target_fetch_is_not_retried_in_a_loop(
+            self, qtbot, tmp_qeth):
+        """A target whose ABI fetch fails (an explorer 429) caches nothing, so
+        each re-render reports it pending again. Re-requesting it there was an
+        endless fetch loop — a 429 storm that kept going after the dialog
+        closed. One request per target per dialog; the entry keeps its
+        selector."""
+        target = "0x" + "8f" * 20
+        fetches: list[str] = []
+
+        class Failing:
+            def fetch(self, chain_id, address):
+                fetches.append(address)
+                raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+        started: list = []
+        dlg = self._batch_details_dialog(Failing(), started)
+        qtbot.addWidget(dlg)
+        dlg._render_decoded_call(self._batch_tree({
+            "operation": 0, "to": target, "value": 0,
+            "data": "0xa9059cbb" + "00" * 64}))
+        qtbot.waitUntil(lambda: bool(fetches))
+        qtbot.wait(300)               # time for a looping re-render to refetch
+        for worker in started:
+            assert worker.wait(2000)
+        assert fetches == [target]
+        assert f"{target}.0xa9059cbb…" in dlg.decoded_view.toPlainText()
+
+    def test_batch_fetch_landing_after_close_is_ignored(self, qtbot, tmp_qeth):
+        """The dialog frees itself on close while a target's fetch may still
+        be in flight; its late result must not reach the freed text view (it
+        raised 'Internal C++ object already deleted') or start another fetch."""
+        target = "0x" + "8f" * 20
+        fetches: list[str] = []
+        release = threading.Event()
+
+        class Slow:
+            def fetch(self, chain_id, address):
+                fetches.append(address)
+                release.wait(5)
+                raise RuntimeError("HTTP Error 429: Too Many Requests")
+
+        started: list = []
+        dlg = self._batch_details_dialog(Slow(), started)
+        destroyed: list[bool] = []
+        dlg.destroyed.connect(lambda *_: destroyed.append(True))
+        dlg.show()
+        dlg._render_decoded_call(self._batch_tree({
+            "operation": 0, "to": target, "value": 0,
+            "data": "0xa9059cbb" + "00" * 64}))
+        qtbot.waitUntil(lambda: bool(fetches))
+        dlg.reject()                       # dismiss → finished → deleteLater
+        qtbot.waitUntil(lambda: bool(destroyed), timeout=2000)
+        release.set()
+        for worker in started:
+            assert worker.wait(2000)
+        qtbot.wait(100)                    # deliver the late ready
+        assert fetches == [target]
+
     def test_pick_mono_font_returns_family_with_bold_variant(self, qtbot):
         """The function name in the decoded-call view stays bold only
         if the chosen monospace family ships a Bold style. The CSS
@@ -2635,6 +2721,29 @@ class TestOwnHeldContractsAreRepriced:
         pw = next(w for w in host.started_workers[mark:]
                   if isinstance(w, tp.PricesWorker))
         assert self.VAULT in [c.lower() for c in pw.contracts]
+
+    def test_failed_discovery_without_a_top_n_still_reads_balances(
+        self, tokens_plugin, monkeypatch,
+    ):
+        """An indexer failure on a chain with no top-N head (Tron, whose
+        TronGrid 429s bursts) must still read the native balance + known
+        tokens directly — not leave the account blank with an error."""
+        from qeth.plugins import tokens as tp
+
+        plugin = tokens_plugin
+        host = _StubHost(chain=ETH, address=ADDR)
+        plugin.attach(host)
+        plugin._token_lists._loaded = True
+        monkeypatch.setattr(plugin._top_tokens, "contracts", lambda cid: [])
+        plugin._refresh(ADDR)
+        tlw = next(w for w in host.started_workers
+                   if isinstance(w, tp.TokenListWorker))
+        mark = len(host.started_workers)
+        tlw.failed.emit("/v1/accounts/T…: HTTP 429")
+        assert any(isinstance(w, tp.BalanceWorker)
+                   for w in host.started_workers[mark:])
+        assert any("Couldn't list this account's tokens" in text
+                   for text, _ in host.status_calls)
 
     def test_fresh_price_overwrites_the_frozen_cached_one(self, tokens_plugin):
         """The other half: once a price DOES come back for it, it must replace

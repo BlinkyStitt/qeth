@@ -199,6 +199,7 @@ class TestPerSubscriptionScoping:
     def _server(self):
         store = MagicMock()
         store.current_chain.return_value = SimpleNamespace(chain_id=1)
+        store.dapp_chain.return_value = SimpleNamespace(chain_id=1)
         return RpcServer(store, port=0)
 
     def test_same_type_subscriptions_coexist_on_one_socket(self):
@@ -262,6 +263,7 @@ class TestWalletMethodsNeverReachTheChain:
         from qeth.chains import DEFAULT_CHAINS
         store = MagicMock()
         store.current_chain.return_value = DEFAULT_CHAINS[0]
+        store.dapp_chain.return_value = DEFAULT_CHAINS[0]
         store.chains = DEFAULT_CHAINS
 
         server = RpcServer(store, port=0)
@@ -368,6 +370,7 @@ def test_chains_changed_broadcast_carries_the_chain_list():
     from qeth.chains import DEFAULT_CHAINS
     store = MagicMock()
     store.current_chain.return_value = DEFAULT_CHAINS[0]
+    store.dapp_chain.return_value = DEFAULT_CHAINS[0]
     store.chains = DEFAULT_CHAINS
     server = RpcServer(store, port=0)
 
@@ -377,7 +380,9 @@ def test_chains_changed_broadcast_carries_the_chain_list():
     _run(server._broadcast_event("chainsChanged", server._ethereum_chains()))
     (sent_sub, chains), = _pushes(ws)
     assert sent_sub == sub
-    assert [c["chainId"] for c in chains] == [c.chain_id for c in DEFAULT_CHAINS]
+    # EVM chains only — a dapp can't use Tron through EIP-1193.
+    assert [c["chainId"] for c in chains] == [c.chain_id for c in DEFAULT_CHAINS
+                                              if c.is_evm]
 
 
 class TestOurOwnExtensionNeverMakesQethCallTheChain:
@@ -419,6 +424,7 @@ class TestOurOwnExtensionNeverMakesQethCallTheChain:
         proxied = []
         store = MagicMock()
         store.current_chain.return_value = DEFAULT_CHAINS[0]
+        store.dapp_chain.return_value = DEFAULT_CHAINS[0]
         store.chains = DEFAULT_CHAINS
         store.default_account = "0x" + "ab" * 20
         server = RpcServer(store, port=0)
@@ -444,6 +450,7 @@ class TestOurOwnExtensionNeverMakesQethCallTheChain:
         from qeth.chains import DEFAULT_CHAINS
         store = MagicMock()
         store.current_chain.return_value = DEFAULT_CHAINS[0]
+        store.dapp_chain.return_value = DEFAULT_CHAINS[0]
         store.chains = DEFAULT_CHAINS
         store.default_account = "0x" + "ab" * 20
         server = RpcServer(store, port=0)
@@ -455,6 +462,7 @@ class TestOurOwnExtensionNeverMakesQethCallTheChain:
         proxied = []
         store = MagicMock()
         store.current_chain.return_value = SimpleNamespace(chain_id=1)
+        store.dapp_chain.return_value = SimpleNamespace(chain_id=1)
         store.chains = []
         server = RpcServer(store, port=0)
 

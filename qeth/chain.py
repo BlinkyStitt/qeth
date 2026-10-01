@@ -87,6 +87,13 @@ def wei_to_ether(wei: int) -> Decimal:
     return Decimal(int(wei)) / _WEI_PER_ETHER
 
 
+def native_amount(raw: int, chain: Chain) -> Decimal:
+    """A native-asset amount in whole coins for ``chain``: wei → ETH on EVM
+    chains, sun → TRX on Tron (``Chain.native_decimals``). Use this over
+    ``wei_to_ether`` wherever the chain may not be EVM."""
+    return Decimal(int(raw)) / (Decimal(10) ** chain.native_decimals)
+
+
 class ChainError(Exception):
     """JSON-RPC error response from the upstream node."""
 
@@ -285,6 +292,9 @@ class EthClient:
         _ensure_heavy_imports()
         self.chain = chain
         self.timeout = timeout
+        # Multicall3 sits at one CREATE2 address on every EVM chain; Tron's
+        # deployment has its own address (Chain.multicall_address).
+        self.multicall_address = chain.multicall_address or MULTICALL3
         self._session = _build_session()
         # Reads fail over across the chain's fallbacks (resilience). Broadcasts
         # do NOT — they use ``self._broadcast_w3``, pinned to the user's chosen
@@ -536,6 +546,7 @@ class Multicall:
     def __init__(self, client: EthClient, *, batch_size: int = 100,
                  block: str = "latest", track_blocks: bool = False):
         self.client = client
+        self._mc = client.multicall_address
         self.batch_size = batch_size
         # Block tag the aggregate3 eth_calls run at. "latest" for the usual
         # live reads; "finalized" pins to irreversible state — used for
@@ -582,7 +593,7 @@ class Multicall:
         values even behind a load balancer, where a separate head query can name
         a block a different backend hasn't got yet."""
         # keccak256("getBlockNumber()")[:4]
-        return self.add(MULTICALL3, bytes.fromhex("42cbb15c"),
+        return self.add(self._mc, bytes.fromhex("42cbb15c"),
                         decoder=_decode_uint256)
 
     def balance_of(self, token: str, holder: str) -> _Pending:
@@ -606,7 +617,7 @@ class Multicall:
         )
         # keccak256("getEthBalance(address)")[:4]
         calldata = bytes.fromhex("4d2301cc") + b"\x00" * 12 + bytes.fromhex(addr_hex)
-        return self.add(MULTICALL3, calldata, decoder=_decode_uint256)
+        return self.add(self._mc, calldata, decoder=_decode_uint256)
 
     def min_block(self) -> int | None:
         """The lowest block any flushed chunk ran at (populated only when
@@ -644,14 +655,14 @@ class Multicall:
                 # balance bug); arbBlockNumber is the L2 height there and
                 # empty (→ fallback) everywhere else — see _ARBSYS above.
                 # keccak256("getBlockNumber()")[:4] = 42cbb15c.
-                calls.insert(0, (MULTICALL3, True, bytes.fromhex("42cbb15c")))
+                calls.insert(0, (self._mc, True, bytes.fromhex("42cbb15c")))
                 calls.insert(1, (_ARBSYS, True, _SEL_ARB_BLOCK_NUMBER))
             calldata = _SEL_AGGREGATE3 + abi_encode(
                 ["(address,bool,bytes)[]"], [calls]
             )
             try:
                 result_hex = self.client.call(
-                    {"to": MULTICALL3, "data": "0x" + calldata.hex()},
+                    {"to": self._mc, "data": "0x" + calldata.hex()},
                     self.block,
                 )
                 decoded = abi_decode(

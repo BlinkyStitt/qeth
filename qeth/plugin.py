@@ -50,6 +50,11 @@ class Host(Protocol):
     def current_chain(self):
         """Return the qeth.chains.Chain currently selected by the user."""
 
+    def switch_chain(self, chain_id: int) -> None:
+        """Select the network ``chain_id`` in the UI, exactly as if the user
+        picked it — e.g. to show a just-added account that only exists on
+        another family (a Tron address added from an Ethereum view)."""
+
     def chain_by_id(self, chain_id: int):
         """Return the configured ``qeth.chains.Chain`` whose id matches,
         or None if no such chain is configured. Used by the pending-tx
@@ -103,8 +108,9 @@ class Host(Protocol):
     def account_addresses(self) -> list[str]:
         """Every wallet address the app knows, lowercased."""
 
-    def account_book(self) -> list[tuple[str, str]]:
-        """(address, label) pairs for the send-dialog address completer."""
+    def account_book(self, family: str | None = None) -> list[tuple[str, str]]:
+        """(address, label) pairs for the send-dialog address completer —
+        limited to a chain family's accounts when ``family`` is given."""
 
     def chain_icon(self, chain_id: int):
         """The (cached) QIcon for a chain, or a null icon."""
@@ -205,6 +211,9 @@ class Slot(QWidget):
                  show_single_tab: bool = False):
         super().__init__(parent)
         self._plugins: list[Plugin] = []
+        # Plugins whose tab is hidden because they don't work on the selected
+        # chain (see set_plugin_available). They get no broadcasts meanwhile.
+        self._unavailable: set[Plugin] = set()
         # Normally the tab bar appears only with ≥2 plugins ("show tabs
         # only when there's a choice"). A slot can opt to show its single
         # tab anyway, so its top chrome matches a sibling multi-plugin
@@ -289,10 +298,48 @@ class Slot(QWidget):
                 old.setParent(None)
         self._corner.addWidget(widget)
 
+    def set_plugin_available(self, plugin: Plugin, available: bool,
+                             address: str | None = None) -> None:
+        """Show or hide a mounted plugin's tab — hidden while the selected
+        chain is one the plugin doesn't support. A hidden plugin gets no
+        account / chain broadcasts; when it comes back it's told the current
+        chain and ``address`` (the selected account) so it isn't stale.
+        Hiding the active plugin switches to the first available one."""
+        try:
+            idx = self._plugins.index(plugin)
+        except ValueError:
+            return
+        was = plugin not in self._unavailable
+        if available == was:
+            return
+        self._tab_bar.setTabVisible(idx, available)
+        # QTabBar doesn't tell the layout its size hint changed, so the row
+        # would keep the bar at its old width: started on Tron (2 tabs), the
+        # 4 tabs back on Ethereum got squeezed behind scroll arrows.
+        self._tab_bar.updateGeometry()
+        if available:
+            self._unavailable.discard(plugin)
+            plugin.on_chain_changed()
+            plugin.on_account_changed(address)
+            return
+        self._unavailable.add(plugin)
+        if self.active() is plugin:
+            first = next((p for p in self._plugins if p not in self._unavailable),
+                         None)
+            if first is not None:
+                self.set_active(first)
+
+    def is_plugin_available(self, plugin: Plugin) -> bool:
+        return plugin in self._plugins and plugin not in self._unavailable
+
     # --- queries --------------------------------------------------------
 
     def plugins(self) -> list[Plugin]:
         return list(self._plugins)
+
+    def available_plugins(self) -> list[Plugin]:
+        """The mounted plugins whose tab is showing, in tab order."""
+        return [p for p in self._plugins if p not in self._unavailable]
 
     def active(self) -> Plugin | None:
         idx = self._stack.currentIndex()
@@ -301,7 +348,10 @@ class Slot(QWidget):
         return None
 
     def set_active(self, plugin: Plugin) -> None:
-        """Switch to a specific plugin. No-op if the plugin isn't mounted."""
+        """Switch to a specific plugin. No-op if the plugin isn't mounted, or
+        its tab is hidden (unavailable on the selected chain)."""
+        if plugin in self._unavailable:
+            return
         try:
             idx = self._plugins.index(plugin)
         except ValueError:
@@ -317,11 +367,13 @@ class Slot(QWidget):
 
     def broadcast_account_changed(self, address: str | None) -> None:
         for p in self._plugins:
-            p.on_account_changed(address)
+            if p not in self._unavailable:
+                p.on_account_changed(address)
 
     def broadcast_chain_changed(self) -> None:
         for p in self._plugins:
-            p.on_chain_changed()
+            if p not in self._unavailable:
+                p.on_chain_changed()
 
     # --- internals ------------------------------------------------------
 

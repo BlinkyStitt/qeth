@@ -54,15 +54,27 @@ from shiboken6 import isValid as _qt_alive   # is a Qt C++ object still alive?
 from ... import QULONGLONG
 from ...abi import (
     KNOWN_EVENT_NAMES, AnyAbiSource, BlockscoutAbiSource, EtherscanV2AbiSource,
-    RoutedAbiSource, decode_call, decode_event,
+    RoutedAbiSource, TronAbiSource, decode_call, decode_event, selector_names,
 )
 from ...abi_cache import AbiCache
 from .contract_identity import (
-    ContractIdentityCache, ContractIdentitySource, describe_identity,
+    ContractIdentityCache, ContractIdentitySource, TronIdentitySource,
+    describe_identity,
 )
-from ...chain import EthClient, wei_to_ether
+from ...chain import EthClient, native_amount, wei_to_ether
+from ...address import codec_for
+from ...tron.client import TronClient, TronError
+from ...tron.history import TronGridTransactionSource
+from .tron_send import _TronFeesMixin, _trx
+from ...tron.tx import TransferContract as TronTransferContract
+from ...tron.tx import decode_raw as decode_tron_raw
+from ...tron.tx import read_fields as read_tron_fields
+from ...tron.tx import strip_address_prefixes as strip_tron_address_prefixes
+from ...explorer import explorer_url
 from .live_watcher import LiveWatcher, PendingTx
-from ...signing import ReplacementFloor, SignerError, SigningRequest
+from ...signing import (
+    ReplacementFloor, SignerError, SigningRequest, TronSigningRequest,
+)
 from ...formatting import format_balance, transfer_notice
 from ...formatting import format_datetime as _format_datetime
 from ...plugin import Plugin
@@ -234,7 +246,32 @@ def _confirmed_from_receipt(old: Transaction, receipt: dict) -> Transaction:
         success=success,
         pending=False,
         raw_signed=None,   # confirmed — no need to keep it for re-broadcast
+        # Tron's receipt carries the fee it burned (``_tron_receipt``).
+        fee=receipt.get("fee", old.fee),
     )
+
+
+def _tron_receipt(info: dict) -> dict:
+    """A Tron ``gettransactioninfobyid`` answer in the shape of an
+    ``eth_getTransactionReceipt`` — what the confirm path consumes: hex
+    block / status / energy as gasUsed, the logs with ``0x`` hex (Tron
+    omits the prefix; log addresses are the 20-byte body), plus ``fee`` in
+    sun, since Tron reports its fee rather than gas × price."""
+    receipt = info.get("receipt") or {}
+    failed = (info.get("result") == "FAILED"
+              or receipt.get("result", "SUCCESS") != "SUCCESS")
+    return {
+        "blockNumber": hex(int(info.get("blockNumber") or 0)),
+        "status": "0x0" if failed else "0x1",
+        "gasUsed": hex(int(receipt.get("energy_usage_total") or 0)),
+        "effectiveGasPrice": "0x0",
+        "fee": int(info.get("fee") or 0),
+        "logs": [{
+            "address": "0x" + str(lg.get("address") or ""),
+            "topics": ["0x" + str(t) for t in lg.get("topics") or []],
+            "data": "0x" + str(lg.get("data") or ""),
+        } for lg in info.get("log") or []],
+    }
 
 
 # ---- pending-tx polling -------------------------------------------------
@@ -274,6 +311,9 @@ class PendingProbeWorker(QThread):
         self._rebroadcast = rebroadcast
 
     def run(self) -> None:
+        if not self._chain.is_evm:
+            self._run_tron()
+            return
         client = EthClient(self._chain)
         try:
             receipt = client.rpc(
@@ -310,6 +350,55 @@ class PendingProbeWorker(QThread):
         # in case the RPC silently dropped it.
         self._try_rebroadcast(client)
         self.still_pending.emit(self._chain, self._tx_hash)
+
+    # Grace past a Tron tx's expiration before calling it dropped: the node
+    # accepts it up to the expiration against HEAD time, and it can still be
+    # packed into a block a moment after.
+    _TRON_DROP_GRACE_MS = 60_000
+
+    def _run_tron(self) -> None:
+        """Tron: included → confirmed (``gettransactioninfobyid``); past its
+        expiration with no info → dropped (it can never be packed now);
+        else still pending, re-pushing the exact signed bytes."""
+        import time
+        client = TronClient(self._chain)
+        try:
+            info = client.transaction_info(self._tx_hash.removeprefix("0x"))
+        except TronError as e:
+            self._try_tron_rebroadcast(client)
+            self.failed.emit(self._chain, self._tx_hash, str(e))
+            return
+        if info:
+            self.confirmed.emit(self._chain, self._tx_hash, _tron_receipt(info))
+            return
+        expiration = self._tron_expiration()
+        if (expiration is not None
+                and time.time() * 1000 > expiration + self._TRON_DROP_GRACE_MS):
+            self.dropped.emit(self._chain, self._tx_hash)
+            return
+        self._try_tron_rebroadcast(client)
+        self.still_pending.emit(self._chain, self._tx_hash)
+
+    def _tron_expiration(self) -> int | None:
+        """The expiration (unix ms) inside the stored signed transaction."""
+        if not self._raw:
+            return None
+        try:
+            fields = read_tron_fields(bytes.fromhex(self._raw.removeprefix("0x")))
+            raw_data = next(v for n, _, v in fields if n == 1)
+            assert isinstance(raw_data, bytes)
+            return decode_tron_raw(raw_data).expiration
+        except (ValueError, StopIteration, AssertionError):
+            return None
+
+    def _try_tron_rebroadcast(self, client) -> None:
+        if not (self._rebroadcast and self._raw):
+            return
+        try:
+            client.broadcast(bytes.fromhex(self._raw.removeprefix("0x")))
+        except TronError as e:
+            # DUP_TRANSACTION_ERROR (already known) / expired — harmless.
+            log.debug("tron re-broadcast of %s: %s", self._tx_hash, e)
 
     def _try_rebroadcast(self, client) -> None:
         if not (self._rebroadcast and self._raw):
@@ -386,7 +475,9 @@ class PendingTxWatcher(QObject):
 
     def _spawn_worker(self, chain, tx) -> None:
         attempts = self._rebroadcast_attempts.get(tx.hash, 0)
-        has_raw = tx.raw_signed is not None
+        # The raw bytes still go to the probe for a dapp's Tron transaction
+        # (its expiration is in them), just never re-pushed.
+        has_raw = tx.raw_signed is not None and tx.rebroadcast
         do_rebroadcast = has_raw and attempts < self.REBROADCAST_MAX_ATTEMPTS
         if (has_raw and not do_rebroadcast
                 and tx.hash not in self._capped_warned):
@@ -796,6 +887,29 @@ def _render_decoded(text_edit, decoded: dict,
     text_edit.setHtml("".join(parts))
 
 
+def _family_known(known: dict[str, str], chain) -> dict[str, str]:
+    """The own-wallet label map keyed the way ``chain`` writes addresses —
+    ``T…`` (lower-cased, for the renderers' case-insensitive lookup) on
+    Tron — so an address rendered in that form still finds its label."""
+    if chain is None or chain.is_evm:
+        return known
+    codec = codec_for(chain)
+    return {codec.display(a).lower(): lbl for a, lbl in known.items()}
+
+
+def _render_decoded_on(chain, text_edit, decoded: dict,
+                       token_context: dict | None = None,
+                       known_addresses=None) -> None:
+    """``_render_decoded`` with addresses in ``chain``'s own form: the
+    decoder speaks 0x hex, a Tron user reads T… — and so does the own-wallet
+    annotation that has to match them."""
+    known = _own_address_labels(known_addresses)
+    if chain is not None and not chain.is_evm:
+        decoded = _addresses_in_family_form(decoded, chain)
+        known = _family_known(known, chain)
+    _render_decoded(text_edit, decoded, token_context, known_addresses=known)
+
+
 def _arg_html(arg: dict, *, indent: int, last: bool,
               token_context: dict | None = None,
               known_addresses: dict[str, str] | None = None) -> str:
@@ -956,6 +1070,8 @@ def _is_full_history(txs: list[Transaction]) -> bool:
     if not txs:
         return False
     nonces = {t.nonce for t in txs}
+    if min(nonces) < 0:
+        return False      # no nonces (Tron): completeness can't be proven
     return 0 in nonces and len(nonces) == max(nonces) + 1
 
 
@@ -964,6 +1080,32 @@ def _oldest_mined_block(txs: list[Transaction]) -> int | None:
     dropped row carries block 0, and a cursor of 0 pages "older than
     genesis": nothing comes back and the history reads as exhausted."""
     return min((t.block_number for t in txs if t.block_number), default=None)
+
+
+class TronActivityCheckWorker(QThread):
+    """Tron's ``NonceCheckWorker``: there's no nonce, but the account record
+    carries ``latest_opration_time`` (sic — java-tron's spelling), when it
+    last sent anything. Later than the newest transaction we hold → something
+    was sent that we never saw: from another wallet, or a dapp broadcasting
+    what qeth only signed. One cheap full-node read per poll; ``None`` on
+    error (the poll is skipped)."""
+
+    checked = Signal(object, object)   # (key, unix ms | None)
+
+    def __init__(self, chain, address: str, key, parent=None):
+        super().__init__(parent)
+        self._chain = chain
+        self._address = address
+        self._key = key
+
+    def run(self) -> None:
+        try:
+            account = TronClient(self._chain).get_account(self._address)
+        except Exception as e:
+            log.warning("tron activity check failed for %s: %s", self._address, e)
+            self.checked.emit(self._key, None)
+            return
+        self.checked.emit(self._key, int(account.get("latest_opration_time") or 0))
 
 
 class NonceCheckWorker(QThread):
@@ -1225,6 +1367,8 @@ class TransactionsPlugin(Plugin):
                 )
             else:
                 source = blockscout
+            # Tron has neither explorer; TronGrid indexes its history.
+            source = RoutedTransactionSource(source, TronGridTransactionSource())
         self._source: TransactionSource = source
         self._disk_cache = disk_cache if disk_cache is not None else TransactionCache()
         # Persist tx-cache writes off the main thread — a 10k-tx save is ~40 ms
@@ -1247,6 +1391,10 @@ class TransactionsPlugin(Plugin):
                 )
             else:
                 abi_source = blockscout_abi
+            # Tron has neither explorer; its contracts carry their ABI on-chain.
+            abi_source = RoutedAbiSource(abi_source, TronAbiSource(
+                (lambda cid: next((c for c in store.chains if c.chain_id == cid), None))
+                if store is not None else None))
         self._abi_source = abi_source
         self._abi_cache = abi_cache if abi_cache is not None else AbiCache()
         # Contract-identity machinery (name / verified / deployer / age),
@@ -1256,7 +1404,8 @@ class TransactionsPlugin(Plugin):
         self._identity_source: ContractIdentitySource | None = (
             ContractIdentitySource(
                 lambda: store.etherscan_api_key,
-                get_code=_make_identity_get_code(store))
+                get_code=_make_identity_get_code(store),
+                tron=TronIdentitySource(_make_identity_get_code(store)))
             if store is not None else None
         )
         self._identity_cache = ContractIdentityCache()
@@ -1451,7 +1600,7 @@ class TransactionsPlugin(Plugin):
             t.nonce
             for (cid, _acct), txs in self._cache.items() if cid == chain_id
             for t in txs
-            if not t.dropped and t.nonce is not None
+            if not t.dropped and t.nonce is not None and t.nonce >= 0
             and (t.from_addr or "").lower() == addr
         ]
         return max(nonces) + 1 if nonces else None
@@ -1700,7 +1849,6 @@ class TransactionsPlugin(Plugin):
         filled in by ``PendingTxWatcher`` when the receipt lands."""
         import time
         addr_lower = req.from_addr.lower()
-        key = (chain.chain_id, addr_lower)
         gas_price_wei = (req.max_fee_per_gas
                           if chain.eip1559 else req.gas_price) or 0
         method_id = req.data[:10] if (req.data and len(req.data) >= 10) else ""
@@ -1721,6 +1869,47 @@ class TransactionsPlugin(Plugin):
             pending=True,
             raw_signed=raw_signed,
         )
+        self._insert_pending(pending, chain)
+
+    def add_tron_pending(self, tx_hash: str, req: TronSigningRequest, chain,
+                         raw_signed: str, *, rebroadcast: bool = True) -> None:
+        """``add_pending`` for a broadcast Tron transaction: the row is built
+        from the transaction's own contract. No nonce (-1 — it orders by its
+        broadcast time); ``raw_signed`` (the signed Transaction hex) lets the
+        watcher read its expiration and re-broadcast it — unless
+        ``rebroadcast`` is False (a dapp's transaction, which the dapp sends)."""
+        import time
+        tx = req.tx
+        c = tx.contract
+        if isinstance(c, TronTransferContract):
+            to, value, data = c.to, c.amount, b""
+        else:
+            to, value, data = c.contract, c.call_value, c.data
+        pending = Transaction(
+            chain_id=chain.chain_id,
+            hash=tx_hash,
+            block_number=0,
+            timestamp=int(time.time()),
+            nonce=-1,
+            from_addr=tx.owner.lower(),
+            to_addr=to.lower(),
+            value_wei=value,
+            gas_used=0,
+            gas_price_wei=0,
+            method_id=("0x" + data[:4].hex()) if len(data) >= 4 else "",
+            input_data="0x" + data.hex(),
+            success=True,            # placeholder until the receipt lands
+            pending=True,
+            raw_signed=raw_signed,
+            rebroadcast=rebroadcast,
+        )
+        self._insert_pending(pending, chain)
+
+    def _insert_pending(self, pending: Transaction, chain) -> None:
+        """Merge a just-broadcast pending row into the cache for its
+        (chain, sender), persist, show it, and make sure it's watched."""
+        key = (chain.chain_id, pending.from_addr)
+        addr_lower = pending.from_addr
         # Hydrate the in-memory cache from disk if this is the first
         # time we touch this view this session — otherwise we'd
         # overwrite the file with just the pending entry on save.
@@ -1851,7 +2040,7 @@ class TransactionsPlugin(Plugin):
         notify = getattr(host, "notify", None) if host is not None else None
         if not callable(notify):
             return
-        amount = format_balance(wei_to_ether(int(tx.value_wei)))
+        amount = format_balance(native_amount(int(tx.value_wei), chain))
         title, body = transfer_notice(
             True, amount, chain.symbol,
             counterparty=tx.to_addr, chain_name=chain.name)
@@ -1985,6 +2174,12 @@ class TransactionsPlugin(Plugin):
         if key in self._nonce_in_flight:
             return
         self._nonce_in_flight.add(key)
+        if not chain.is_evm:
+            # No nonce on Tron: the account's last-operation time instead.
+            tron_worker = TronActivityCheckWorker(chain, address, key)
+            tron_worker.checked.connect(self._on_tron_activity)
+            self.host.start_worker(tron_worker)
+            return
         worker = NonceCheckWorker(chain, address, key)
         worker.checked.connect(self._on_external_nonce)
         self.host.start_worker(worker)
@@ -2015,6 +2210,28 @@ class TransactionsPlugin(Plugin):
             return
         if not self._hold_elapsed(self._nonce_hold, key):
             return   # already fetched for this gap; the explorer lags behind
+        self._strike(self._nonce_hold, key)
+        self._exhausted.discard(key)
+        self._fetch_page(key, addr, page=1)
+
+    def _on_tron_activity(self, key, last_op_ms) -> None:
+        """``_on_external_nonce`` for Tron: the account last sent something at
+        ``last_op_ms``. Newer than every row we hold (their times are block
+        times, which follow their own operation's) → re-fetch the newest page.
+        The same back-off hold: TronGrid's index trails the chain by seconds."""
+        self._nonce_in_flight.discard(key)
+        if not last_op_ms or self.host is None:
+            return
+        addr = self.host.selected_address
+        if addr is None or key != (self.host.current_chain().chain_id, addr.lower()):
+            return
+        newest = max((t.timestamp for t in self._hydrated(key) if not t.dropped),
+                     default=0)
+        if last_op_ms // 1000 <= newest:
+            self._nonce_hold.pop(key, None)
+            return
+        if not self._hold_elapsed(self._nonce_hold, key):
+            return
         self._strike(self._nonce_hold, key)
         self._exhausted.discard(key)
         self._fetch_page(key, addr, page=1)
@@ -2159,6 +2376,24 @@ class TransactionsPlugin(Plugin):
         if meta and meta.get("symbol"):
             return meta["symbol"]
         return self._symbol_cache.get((chain_id, contract.lower()))
+
+    def _fill_verb(self, chain_id: int, tx: Transaction | None,
+                   activity: Activity) -> Activity:
+        """A cached activity still named by its bare selector (its contract's
+        ABI wasn't known when it was built — e.g. Tron's, before
+        ``TronAbiSource``) gets the method's name once the ABI cache has it.
+        Disk only: a two-sided activity is never re-fetched, so this is what
+        renames it."""
+        verb = activity.verb
+        if (tx is None or not tx.to_addr or len(verb) != 10
+                or not verb.startswith("0x")):
+            return activity
+        abi = self._abi_cache.load(chain_id, tx.to_addr)
+        name = selector_names(abi).get(verb) if isinstance(abi, list) else None
+        if not name:
+            return activity
+        from dataclasses import replace
+        return replace(activity, verb=name)
 
     def _fill_symbols(self, chain_id: int, activity: Activity) -> Activity:
         """Rewrite any leg whose symbol is unknown ("?"/empty) with the token's
@@ -2324,7 +2559,9 @@ class TransactionsPlugin(Plugin):
             # get a worker. Re-scan any cached-coinless rows by receipt too,
             # so a tokentx miss persisted last session gets a second chance
             # without forcing a full re-resolve.
-            primed = {h: self._fill_symbols(chain.chain_id, a)
+            by_hash = {t.hash: t for t in cached}
+            primed = {h: self._fill_verb(chain.chain_id, by_hash.get(h),
+                                         self._fill_symbols(chain.chain_id, a))
                       for h, a in self._activity_cache.load(
                           chain.chain_id, address).items()}
             self._panel.prime_activities(primed)
@@ -2538,11 +2775,11 @@ class TransactionsPlugin(Plugin):
         # older entries (scroll case) append. Both grow the visible
         # window without re-rendering the rest of the table.
         shown = self._displayed_count.get(key, 0)
-        top_nonce = existing[0].nonce if existing else -1
-        newer = [t for t in new_rows if t.nonce > top_nonce]
-        older = [t for t in new_rows if t.nonce <= top_nonce]
+        top_key = existing[0].order_key if existing else -1
+        newer = [t for t in new_rows if t.order_key > top_key]
+        older = [t for t in new_rows if t.order_key <= top_key]
         if newer:
-            newer.sort(key=lambda t: t.nonce, reverse=True)
+            newer.sort(key=lambda t: t.order_key, reverse=True)
             self._panel.prepend_transactions(newer)
             shown += len(newer)
         # Append older rows only if the user has already scrolled
@@ -2551,7 +2788,7 @@ class TransactionsPlugin(Plugin):
         # entries below, which would look weird. We just save them
         # to the cache and let the next scroll-to-bottom reveal them.
         if older and shown >= len(existing):
-            older.sort(key=lambda t: t.nonce, reverse=True)
+            older.sort(key=lambda t: t.order_key, reverse=True)
             self._panel.append_transactions(older)
             shown += len(older)
         self._displayed_count[key] = shown
@@ -2847,6 +3084,9 @@ class TransactionListPanel(QWidget):
     def set_context(self, chain, viewer_address: str) -> None:
         self._chain = chain
         self._viewer = viewer_address
+        # Tron transactions have no nonce (a block reference + expiration
+        # guard against replay) — the column could only ever be empty there.
+        self.table.setColumnHidden(_C_NONCE, not chain.is_evm)
         self._update_action_buttons()
 
     # --- Activity column (verb + coins moved) -------------------------------
@@ -3227,7 +3467,7 @@ class TransactionListPanel(QWidget):
         status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         status.setToolTip(tip)
 
-        nonce = QTableWidgetItem(str(tx.nonce))
+        nonce = QTableWidgetItem(str(tx.nonce) if tx.nonce >= 0 else "")
         nonce.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         time_item = QTableWidgetItem(_format_datetime(tx.timestamp))
@@ -3289,10 +3529,9 @@ class TransactionListPanel(QWidget):
         return super().eventFilter(obj, event)
 
     def _open_in_explorer(self, tx: Transaction) -> None:
-        if self._chain is None or not self._chain.explorer:
-            return
-        url = f"{self._chain.explorer.rstrip('/')}/tx/{tx.hash}"
-        QDesktopServices.openUrl(QUrl(url))
+        url = explorer_url(self._chain, "tx", tx.hash)
+        if url:
+            QDesktopServices.openUrl(QUrl(url))
 
     def _on_context_menu(self, pos) -> None:
         # Resolve the row, not the item: the justify gap columns hold no
@@ -3387,11 +3626,15 @@ class ContractIdentityWorker(QThread):
     def __init__(self, source: ContractIdentitySource | None,
                  cache: ContractIdentityCache, chain_id: int, address: str,
                  my_addresses, tx_cache: TransactionCache | None = None,
-                 mode: str = "interact", parent=None):
+                 mode: str = "interact",
+                 short: Callable[[str], str] | None = None, parent=None):
         super().__init__(parent)
         self._source = source
         self._cache = cache
         self._chain_id = chain_id
+        # How the badge abbreviates an address (a deployer) — the chain's own
+        # form, T… on Tron; None = the default 0x form.
+        self._short = short
         self._address = address
         self._my = list(my_addresses or [])
         self._tx_cache = tx_cache
@@ -3438,7 +3681,7 @@ class ContractIdentityWorker(QThread):
         badge = describe_identity(
             idy, my_addresses=self._my, deployer_count=count,
             interaction_count=interactions, approval_count=approvals,
-            context=self._mode, now_ts=time.time())
+            context=self._mode, now_ts=time.time(), short=self._short)
         self.ready.emit(badge)
 
 
@@ -3808,8 +4051,11 @@ class _EventsView(QWidget):
 
     def _event_html(self, decoded, lg, doc) -> str:
         contract = (decoded or lg).get("contract") or lg.get("address") or "?"
+        # Shown in the chain's form (T… on Tron); lookups below stay on hex.
+        shown = (codec_for(self.chain).display(contract)
+                 if contract.startswith("0x") else contract)
         contract_span = (
-            f'<span style="color:{_TYPE_COLOR};">{_escape_html(contract)}</span>'
+            f'<span style="color:{_TYPE_COLOR};">{_escape_html(shown)}</span>'
         )
         prefix = self._token_prefix_html(doc, contract)
         if decoded is None:
@@ -3821,10 +4067,13 @@ class _EventsView(QWidget):
         head = f"{prefix}{contract_span}.<b>{_escape_html(decoded['event'])}</b>(\n"
         args = decoded.get("args") or []
         token_context = self._event_token_context(contract, decoded)
+        known = self._known_addresses
+        if not self.chain.is_evm:
+            args = _addresses_in_family_form(args, self.chain)
+            known = _family_known(known, self.chain)
         body = "".join(
             _arg_html(a, indent=1, last=(j == len(args) - 1),
-                       token_context=token_context,
-                       known_addresses=self._known_addresses)
+                       token_context=token_context, known_addresses=known)
             for j, a in enumerate(args)
         )
         return head + body + ")\n"
@@ -4129,7 +4378,9 @@ def _make_identity_row(*, to_addr: str | None, chain,
     """Build an identity-row label and a ``kick()`` that fills it via a
     background ContractIdentityWorker. ``mode`` picks the familiarity verb
     ("interact" / "send" / "approve" — see ContractIdentityWorker). Returns
-    ``(None, None)`` when there's no address to identify."""
+    ``(None, None)`` when there's no address to identify. On Tron the source
+    delegates to Tronscan (``TronIdentitySource``) and the badge names
+    addresses in their ``T…`` form."""
     if not to_addr:
         return None, None
     label = QLabel("")
@@ -4166,7 +4417,8 @@ def _make_identity_row(*, to_addr: str | None, chain,
         label.setEnabled(False)
         worker = ContractIdentityWorker(
             identity_source, identity_cache, chain.chain_id, to_addr,
-            my_addresses, tx_cache=tx_cache, mode=mode)
+            my_addresses, tx_cache=tx_cache, mode=mode,
+            short=None if chain.is_evm else codec_for(chain).short)
         worker.ready.connect(_apply)
         start_worker(worker)
 
@@ -4221,7 +4473,7 @@ class TransactionDetailsDialog(Dialog):
         # ABIs are fetched per target and folded into the tree we keep here,
         # which is re-rendered as each one lands.
         self._decoded_tree: dict | None = None
-        self._batch_abi_inflight: set[str] = set()
+        self._batch_abi_requested: set[str] = set()
         # Optional dependencies for ERC-20 annotation on the "To:" row.
         # Plugin passes both when available; tests can leave them None
         # and the dialog falls back to a plain address line.
@@ -4293,19 +4545,21 @@ class TransactionDetailsDialog(Dialog):
         else:
             status_text = "✗ Reverted"
         form.addRow("Status:", self._value_label(status_text))
-        form.addRow("Nonce:", self._value_label(str(tx.nonce)))
+        if tx.nonce >= 0:          # a Tron tx has no nonce
+            form.addRow("Nonce:", self._value_label(str(tx.nonce)))
         dt = datetime.datetime.fromtimestamp(tx.timestamp)
         form.addRow("Date:", self._value_label(dt.strftime("%c")))
         form.addRow("Timestamp:", self._value_label(f"{tx.timestamp} (unix)"))
         form.addRow("Block:", self._value_label(str(tx.block_number)))
+        # Tron writes txids without 0x (Tronscan, TronLink) — show it so.
+        shown_hash = tx.hash if chain.is_evm else tx.hash.removeprefix("0x")
         form.addRow("Hash:",
-                    self._link_label(tx.hash,
+                    self._link_label(shown_hash,
                                      self._explorer_url("tx", tx.hash),
                                      monospace=True))
-        from_cs = to_checksum_address(tx.from_addr)
         form.addRow("From:",
-                    self._link_label(from_cs,
-                                     self._explorer_url("address", from_cs),
+                    self._link_label(codec_for(chain).display(tx.from_addr),
+                                     self._explorer_url("address", tx.from_addr),
                                      monospace=True))
         form.addRow(
             "To:", self._build_to_row(tx.to_addr, tx.from_addr, chain, mono),
@@ -4337,7 +4591,8 @@ class TransactionDetailsDialog(Dialog):
         # estimate matches the fee row below (at the current native price).
         if tx.value_wei:
             value_text = _native_value_with_usd(
-                tx.value_wei, chain.symbol, self._native_price_usd)
+                tx.value_wei, chain.symbol, self._native_price_usd,
+                decimals=chain.native_decimals)
         else:
             value_text = "0"
         form.addRow("Value:", self._value_label(value_text))
@@ -4351,7 +4606,16 @@ class TransactionDetailsDialog(Dialog):
         # arrives. The pending row's gas_price_wei reflects the user's
         # signed maxFeePerGas, not what the chain will actually
         # charge, so showing it as the realised rate would be wrong.
-        if not tx.pending and tx.gas_used > 0:
+        if tx.fee is not None and not tx.pending:
+            # The chain reported the fee itself (Tron: burned bandwidth +
+            # energy) — there's no gas / gas price to show.
+            form.addRow("Fee paid:", self._value_label(
+                _native_value_with_usd(tx.fee, chain.symbol,
+                                       self._native_price_usd,
+                                       decimals=chain.native_decimals)
+                if tx.fee else
+                "none — staked / free resources covered it"))
+        elif not tx.pending and tx.gas_used > 0:
             form.addRow("Gas used:",
                         self._value_label(f"{tx.gas_used:,}"))
             gwei = wei_to_ether(tx.gas_price_wei) * Decimal(10**9)
@@ -4451,11 +4715,18 @@ class TransactionDetailsDialog(Dialog):
             logs_worker.ready.connect(self._events.set_logs)
             self._start_worker(logs_worker)
 
+    def _calldata(self) -> str:
+        """The tx's calldata as a decoder should read it — on Tron with the
+        21-byte ``41…`` address words some wallets write normalised."""
+        if self.chain.is_evm:
+            return self.tx.input_data
+        return strip_tron_address_prefixes(self.tx.input_data)
+
     def _on_abi_ready(self, abi) -> None:
         decoded = None
         if isinstance(abi, list):
             decoded = decode_call(
-                abi, self.tx.input_data, address=self.tx.to_addr,
+                abi, self._calldata(), address=self.tx.to_addr,
             )
         if decoded is not None:
             self._render_decoded_call(decoded)
@@ -4465,7 +4736,7 @@ class TransactionDetailsDialog(Dialog):
         # 4-byte signature DB like an explorer.
         self._abi_state = abi
         self.decoded_view.setPlainText("(decoding via signature database…)")
-        worker = SignatureFetchWorker(self.tx.input_data)
+        worker = SignatureFetchWorker(self._calldata())
         worker.ready.connect(self._on_signature_ready)
         self._start_worker(worker)
 
@@ -4496,18 +4767,20 @@ class TransactionDetailsDialog(Dialog):
             token_info=self._token_info)
         if self._abi_source is None:
             return
-        for addr in sorted(pending):
-            if addr in self._batch_abi_inflight:
-                continue
-            self._batch_abi_inflight.add(addr)
+        # Once per target per dialog: a failed fetch caches nothing, so the
+        # re-render reports the target as pending again — re-requesting it
+        # there looped forever (a 429 storm that outlived the dialog). An
+        # entry whose fetch failed keeps its selector; re-opening retries.
+        for addr in sorted(pending - self._batch_abi_requested):
+            self._batch_abi_requested.add(addr)
             worker = AbiFetchWorker(
                 self._abi_source, self._abi_cache, self.chain.chain_id, addr)
-            worker.ready.connect(
-                lambda _abi, a=addr: self._on_batch_abi_ready(a))
+            # A bound slot, not a lambda: Qt drops the connection when the
+            # dialog is destroyed, so a fetch landing after close is ignored.
+            worker.ready.connect(self._on_batch_abi_ready)
             self._start_worker(worker)
 
-    def _on_batch_abi_ready(self, addr: str) -> None:
-        self._batch_abi_inflight.discard(addr)
+    def _on_batch_abi_ready(self, _abi) -> None:
         if self._decoded_tree is not None:
             self._render_decoded_call(self._decoded_tree)
 
@@ -4524,8 +4797,8 @@ class TransactionDetailsDialog(Dialog):
                     "symbol": entry.symbol,
                     "decimals": entry.decimals,
                 }
-        _render_decoded(
-            self.decoded_view, decoded, token_context,
+        _render_decoded_on(
+            self.chain, self.decoded_view, decoded, token_context,
             known_addresses=self._known_addresses,
         )
 
@@ -4574,24 +4847,12 @@ class TransactionDetailsDialog(Dialog):
 
     def _explorer_url(self, kind: str, addr: str,
                        *, ref_addr: str | None = None) -> str | None:
-        """Build an Etherscan-family URL: ``tx``/``address``/``token``.
+        """Build an explorer URL: ``tx``/``address``/``token``.
         ``token`` with ``ref_addr`` appends ``?a=<ref>`` — Etherscan's
         convention for filtering the token page to a specific holder
         (so clicking a token in the To row jumps straight to the
         sender's transfer history for that token)."""
-        if not self.chain.explorer or not addr:
-            return None
-        base = self.chain.explorer.rstrip("/")
-        if kind == "tx":
-            return f"{base}/tx/{addr}"
-        if kind == "address":
-            return f"{base}/address/{addr}"
-        if kind == "token":
-            url = f"{base}/token/{addr}"
-            if ref_addr:
-                url += f"?a={ref_addr}"
-            return url
-        return None
+        return explorer_url(self.chain, kind, addr, ref_addr=ref_addr)
 
     # --- "To:" row composition ------------------------------------------
 
@@ -4624,6 +4885,7 @@ class TransactionDetailsDialog(Dialog):
         # insensitive, so the rebinding is safe.
         addr = to_checksum_address(to_addr)
         from_cs = to_checksum_address(from_addr)
+        shown = codec_for(chain).display(addr)     # T… on Tron
 
         entry = (self._token_info(chain.chain_id, addr)
                  if self._token_info is not None else None)
@@ -4651,12 +4913,12 @@ class TransactionDetailsDialog(Dialog):
                     f'style="color: {self._link_color}; '
                     f'text-decoration: underline; '
                     f'font-family: monospace;">'
-                    f"{_escape_html(addr)}</a>"
+                    f"{_escape_html(shown)}</a>"
                 )
             else:
                 addr_html = (
                     f'<span style="font-family: monospace;">'
-                    f"{_escape_html(addr)}</span>"
+                    f"{_escape_html(shown)}</span>"
                 )
             label = QLabel(
                 f"{_escape_html(entry.symbol)} ({addr_html})"
@@ -4666,7 +4928,7 @@ class TransactionDetailsDialog(Dialog):
             label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
             )
-            _install_copy_menu(label, addr, token_url)
+            _install_copy_menu(label, shown, token_url)
             row.addWidget(label, 1)
 
             if self._icon_cache is not None:
@@ -4680,7 +4942,7 @@ class TransactionDetailsDialog(Dialog):
                     )
         else:
             row.addWidget(
-                self._link_label(addr,
+                self._link_label(shown,
                                  self._explorer_url("address", addr),
                                  monospace=True),
                 1,
@@ -4759,12 +5021,29 @@ def _format_usd(usd) -> str:
     return f"{usd:.6f} USD"
 
 
-def _native_value_with_usd(wei: int, symbol: str, price) -> str:
+def _addresses_in_family_form(node, chain):
+    """A decoded-call tree with every ``address`` value in the chain's own
+    form (T… on Tron) — the decoder speaks 0x hex, the user doesn't."""
+    codec = codec_for(chain)
+    if isinstance(node, list):
+        return [_addresses_in_family_form(n, chain) for n in node]
+    if not isinstance(node, dict):
+        return node
+    out = {k: _addresses_in_family_form(v, chain) if k in ("args", "children", "call")
+           else v for k, v in node.items()}
+    if out.get("type") == "address" and isinstance(out.get("value"), str):
+        out["value"] = codec.display(out["value"])
+    return out
+
+
+def _native_value_with_usd(wei: int, symbol: str, price, *,
+                           decimals: int = 18) -> str:
     """A native amount as ``X SYMBOL  (≈$Y)`` — the USD parenthetical matches
     the Expected-fee line; dropped when no price is known. Used for the
     Value / Total rows so they read like the fee instead of trailing a raw
-    ``(… wei)`` (which the exact ether Decimal already conveys)."""
-    ether = wei_to_ether(wei)
+    ``(… wei)`` (which the exact ether Decimal already conveys). ``decimals``
+    is the chain's native decimals (6 for TRX)."""
+    ether = Decimal(int(wei)) / (Decimal(10) ** decimals)
     text = f"{ether} {symbol}"
     if price is not None:
         text += f"  ({_format_usd(ether * price)})"
@@ -5097,7 +5376,7 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         # binding a generation into a lambda: a lambda isn't receiver-tracked,
         # so a worker that outlives a closed dialog would fire into the deleted
         # dialog (segfault). A bound-method connection auto-disconnects.
-        self._gas_worker: GasSuggestionWorker | None = None
+        self._gas_worker: QThread | None = None
         self._base_fee_wei = 0
         self._estimated_gas = 0
         self._suggested_nonce: int | None = None
@@ -5161,7 +5440,8 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         from_url = self._explorer_url("address", self._from_addr)
         header.addRow(
             "From:",
-            self._link_label(self._from_addr, from_url, monospace=True),
+            self._link_label(self._display(self._from_addr), from_url,
+                             monospace=True),
         )
         # Subclass-specific header rows (recipient / amount / identity …).
         self._build_header_rows(header, outer)
@@ -5231,14 +5511,6 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
 
         root.addWidget(self.revert_banner())
         root.addWidget(self.buttons)
-
-        # Recompute the "Expected fee" line whenever the user touches an
-        # input that affects it: gas limit and either (1559) priority tip or
-        # (legacy) gas price. spin_max_fee is excluded — it caps the upper
-        # bound but doesn't change the expected effective rate (base + tip).
-        for sp in (self.spin_gas, self.spin_priority, self.spin_gas_price):
-            if sp is not None:
-                sp.valueChanged.connect(self._update_max_total)
 
         # Debounced gas re-estimate scaffold — subclasses decide when to
         # start the timer (Send: on a valid recipient).
@@ -5318,6 +5590,13 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         gas_form.addRow("Network base fee:", self.base_fee_lbl)
         self._gas_section.set_content_layout(gas_form)
         outer.addWidget(self._gas_section)
+        # Recompute the "Expected fee" line whenever the user touches an
+        # input that affects it: gas limit and either (1559) priority tip or
+        # (legacy) gas price. spin_max_fee is excluded — it caps the upper
+        # bound but doesn't change the expected effective rate (base + tip).
+        for sp in (self.spin_gas, self.spin_priority, self.spin_gas_price):
+            if sp is not None:
+                sp.valueChanged.connect(self._update_max_total)
 
     # --- shared widget helpers -------------------------------------
 
@@ -5352,19 +5631,11 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
 
     def _explorer_url(self, kind: str, addr: str,
                        *, ref_addr: str | None = None) -> str | None:
-        if not self.chain.explorer or not addr:
-            return None
-        base = self.chain.explorer.rstrip("/")
-        if kind == "tx":
-            return f"{base}/tx/{addr}"
-        if kind == "address":
-            return f"{base}/address/{addr}"
-        if kind == "token":
-            url = f"{base}/token/{addr}"
-            if ref_addr:
-                url += f"?a={ref_addr}"
-            return url
-        return None
+        return explorer_url(self.chain, kind, addr, ref_addr=ref_addr)
+
+    def _display(self, addr: str) -> str:
+        """``addr`` as the user reads it on this chain (EIP-55, or T…)."""
+        return codec_for(self.chain).display(addr)
 
     def _build_token_header_row(self, asset: dict, mono: QFont) -> QWidget:
         """Icon + "SYMBOL (linked-contract-addr)" — same treatment
@@ -5388,12 +5659,12 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
                 f'style="color: {self._link_color}; '
                 f'text-decoration: underline; '
                 f'font-family: monospace;">'
-                f"{_escape_html(addr)}</a>"
+                f"{_escape_html(self._display(addr))}</a>"
             )
         else:
             addr_html = (
                 f'<span style="font-family: monospace;">'
-                f"{_escape_html(addr)}</span>"
+                f"{_escape_html(self._display(addr))}</span>"
             )
         label = QLabel(f"{_escape_html(asset['symbol'])} ({addr_html})")
         label.setTextFormat(Qt.TextFormat.RichText)
@@ -5401,7 +5672,7 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         label.setTextInteractionFlags(
             Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        _install_copy_menu(label, addr, token_url)
+        _install_copy_menu(label, self._display(addr), token_url)
         row.addWidget(label, 1)
 
         if self._icon_cache is not None:
@@ -5465,12 +5736,12 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
                     f'style="color: {self._link_color}; '
                     f'text-decoration: underline; '
                     f'font-family: monospace;">'
-                    f"{_escape_html(addr)}</a>"
+                    f"{_escape_html(self._display(addr))}</a>"
                 )
             else:
                 addr_html = (
                     f'<span style="font-family: monospace;">'
-                    f"{_escape_html(addr)}</span>"
+                    f"{_escape_html(self._display(addr))}</span>"
                 )
             label = QLabel(
                 f"{_escape_html(entry.symbol)} ({addr_html})"
@@ -5480,7 +5751,7 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
             label.setTextInteractionFlags(
                 Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.TextSelectableByMouse
             )
-            _install_copy_menu(label, addr, token_url)
+            _install_copy_menu(label, self._display(addr), token_url)
             row.addWidget(label, 1)
 
             if self._icon_cache is not None:
@@ -5494,7 +5765,7 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
                     )
         else:
             row.addWidget(
-                self._link_label(addr,
+                self._link_label(self._display(addr),
                                  self._explorer_url("address", addr),
                                  monospace=True),
                 1,
@@ -5540,7 +5811,8 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         model = QStandardItemModel(self)
         for low, label in sorted(self._address_book.items(),
                                  key=lambda kv: (kv[1] or "￿").lower()):
-            addr = to_checksum_address(low)
+            # The chain's own form — what the recipient field parses back.
+            addr = self._display(low)
             disp = f"{label} — {addr}" if label else addr
             item = QStandardItem(disp)
             item.setData(addr, Qt.ItemDataRole.UserRole)
@@ -5651,7 +5923,8 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
     def _native_value_text(self, wei: int) -> str:
         """A native amount with a USD estimate, like the fee line."""
         return _native_value_with_usd(wei, self.chain.symbol,
-                                      self._native_price_usd)
+                                      self._native_price_usd,
+                                      decimals=self.chain.native_decimals)
 
     def set_signing_in_progress(self, busy: bool) -> None:
         """Lock / unlock the dialog while the host runs the
@@ -5667,15 +5940,38 @@ class _TxComposerDialog(_EventPreviewMixin, Dialog):
         for btn in self.buttons.buttons():
             if btn is not self.confirm_btn:
                 btn.setEnabled(not busy)
-        self.spin_gas.setEnabled(not busy and self._gas_ready)
+        self._set_fee_controls_enabled(not busy and self._gas_ready)
+        self._set_inputs_enabled(not busy)
+
+    def _set_fee_controls_enabled(self, enabled: bool) -> None:
+        """Enable / disable the editable fee controls — on EVM the gas limit
+        and the fee spinners of the chain's fee mode."""
+        self.spin_gas.setEnabled(enabled)
         if self.chain.eip1559:
             assert self.spin_max_fee is not None and self.spin_priority is not None
-            self.spin_max_fee.setEnabled(not busy and self._gas_ready)
-            self.spin_priority.setEnabled(not busy and self._gas_ready)
+            self.spin_max_fee.setEnabled(enabled)
+            self.spin_priority.setEnabled(enabled)
         else:
             assert self.spin_gas_price is not None
-            self.spin_gas_price.setEnabled(not busy and self._gas_ready)
-        self._set_inputs_enabled(not busy)
+            self.spin_gas_price.setEnabled(enabled)
+
+    def _native_fee_reserve(self) -> int:
+        """What a native "Max" send must leave behind for the fee: the UPPER
+        bound the chain may charge — ``gas × maxFeePerGas`` (EIP-1559) or
+        ``gas × gasPrice`` (legacy), maxFeePerGas being the ceiling the user
+        authorised — bumped 50 % to absorb an estimate undershoot, the user
+        nudging the fee up before sending, or a basefee burst. The user
+        explicitly preferred 'too much margin' over 'too little': dust left
+        in the wallet is fine, an 'insufficient funds' reject is not."""
+        gas = max(self._estimated_gas or self.spin_gas.value(),
+                  self.spin_gas.value())
+        if self.chain.eip1559:
+            assert self.spin_max_fee is not None
+            ceiling = _gwei_to_wei(self.spin_max_fee.value())
+        else:
+            assert self.spin_gas_price is not None
+            ceiling = _gwei_to_wei(self.spin_gas_price.value())
+        return (gas * ceiling * 3) // 2
 
     def _update_state(self) -> None:
         ok = self._gas_ready and self._inputs_valid()
@@ -6108,8 +6404,8 @@ class SignTransactionDialog(_TxComposerDialog):
                     "symbol": entry.symbol,
                     "decimals": entry.decimals,
                 }
-        _render_decoded(
-            self.decoded_view, decoded, token_context,
+        _render_decoded_on(
+            self.chain, self.decoded_view, decoded, token_context,
             known_addresses=self._known_addresses,
         )
 
@@ -6296,7 +6592,9 @@ class SendTokenDialog(_TxComposerDialog):
         # can paste partial text without seeing intermediate errors. The
         # ▾ button pops the address-book completer over the user's wallets.
         to_row, self.recipient_edit = self._make_address_field()
-        self.recipient_edit.setPlaceholderText("0x… address or name.eth")
+        self.recipient_edit.setPlaceholderText(
+            "0x… address or name.eth" if self.chain.is_evm
+            else f"{codec_for(self.chain).placeholder} address")
         header.addRow("&To:", to_row)
         # ENS: when the recipient is a name (name.eth), forward-resolve it
         # and show the 0x address here (highlighted) so the user verifies
@@ -6436,7 +6734,8 @@ class SendTokenDialog(_TxComposerDialog):
         worker = ContractIdentityWorker(
             self._identity_source, self._identity_cache, self.chain.chain_id,
             addr, self._known_addresses, tx_cache=self._tx_cache,
-            mode="send")
+            mode="send",
+            short=None if self.chain.is_evm else codec_for(self.chain).short)
         worker.ready.connect(
             lambda badge, a=addr: self._on_identity_ready(a, badge))
         self._start_worker(worker)
@@ -6502,18 +6801,7 @@ class SendTokenDialog(_TxComposerDialog):
         code path for native."""
         raw = self._asset["balance_raw"]
         if self._asset["is_native"] and self._gas_ready:
-            gas = max(
-                self._estimated_gas or self.spin_gas.value(),
-                self.spin_gas.value(),
-            )
-            if self.chain.eip1559:
-                assert self.spin_max_fee is not None and self.spin_priority is not None
-                ceiling = _gwei_to_wei(self.spin_max_fee.value())
-            else:
-                assert self.spin_gas_price is not None
-                ceiling = _gwei_to_wei(self.spin_gas_price.value())
-            gas_cost = (gas * ceiling * 3) // 2
-            raw = max(0, raw - gas_cost)
+            raw = max(0, raw - self._native_fee_reserve())
         bal = (
             Decimal(raw) / (Decimal(10) ** self._asset["decimals"])
         )
@@ -6531,7 +6819,8 @@ class SendTokenDialog(_TxComposerDialog):
         the source of truth for _parsed_recipient(), so Send stays disabled
         until a name resolves."""
         text = self.recipient_edit.text().strip()
-        if not self._looks_like_ens(text):
+        # ENS names Ethereum addresses; on Tron a dotted string is no name.
+        if not self.chain.is_evm or not self._looks_like_ens(text):
             if self._ens_input:        # was a name, now a plain address/empty
                 self._ens_input = ""
                 self._ens_resolved = None
@@ -6606,11 +6895,10 @@ class SendTokenDialog(_TxComposerDialog):
 
     def _parsed_recipient(self) -> str | None:
         text = self.recipient_edit.text().strip()
-        if text.startswith("0x") and len(text) == 42:
-            try:
-                return to_checksum_address(text)
-            except Exception:
-                return None
+        # An address in the chain's own form (0x…, or T… on Tron) → hex.
+        addr = codec_for(self.chain).parse(text)
+        if addr is not None:
+            return addr
         # An ENS name is a valid recipient only once it has resolved.
         if text and text.lower() == self._ens_input and self._ens_resolved:
             return self._ens_resolved
@@ -6727,11 +7015,10 @@ class SendTokenDialog(_TxComposerDialog):
         if self.total_lbl is None:
             return
         amount_raw = self._parsed_amount_raw() or 0
-        total_wei = fee_wei + amount_raw
-        text = f"{wei_to_ether(total_wei)} {self.chain.symbol}"
+        total = native_amount(fee_wei + amount_raw, self.chain)
+        text = f"{total} {self.chain.symbol}"
         if self._native_price_usd is not None:
-            usd = wei_to_ether(total_wei) * self._native_price_usd
-            text += f"  ({_format_usd(usd)})"
+            text += f"  ({_format_usd(total * self._native_price_usd)})"
         self.total_lbl.setText(text)
 
     def _refresh_decoded_view(self) -> None:
@@ -6754,7 +7041,8 @@ class SendTokenDialog(_TxComposerDialog):
         amount_raw = self._parsed_amount_raw_unchecked()
         # Use sentinels for missing inputs so the user sees the
         # shape of the call as they type, rather than an empty box.
-        recipient_str = recipient if recipient is not None else "0x…"
+        recipient_str = (recipient if recipient is not None
+                         else codec_for(self.chain).placeholder)
         amount_str = str(amount_raw) if amount_raw is not None else "?"
         decoded = {
             "function": "transfer",
@@ -6769,8 +7057,8 @@ class SendTokenDialog(_TxComposerDialog):
                 "symbol": self._asset["symbol"],
                 "decimals": self._asset["decimals"],
             }
-        _render_decoded(
-            self.decoded_view, decoded, token_context,
+        _render_decoded_on(
+            self.chain, self.decoded_view, decoded, token_context,
             known_addresses=self._known_addresses,
         )
 
@@ -6835,3 +7123,91 @@ class SendTokenDialog(_TxComposerDialog):
             value_wei=0,
             data=_erc20_transfer_calldata(recipient, amount_raw),
         )
+
+
+class TronSendTokenDialog(_TronFeesMixin, SendTokenDialog):
+    """``SendTokenDialog`` on Tron: the same dialog — recipient, amount, Max,
+    USD value, identity, decoded call, Events preview, revert banner — with
+    Tron's fee half (``tron_send._TronFeesMixin``): the network resources a
+    transaction burns instead of gas, and ``finalised_tron`` instead of an
+    EVM request."""
+
+
+class TronSignTransactionDialog(_TronFeesMixin, SignTransactionDialog):
+    """A dapp's Tron transaction (``tron_signTransaction``) in the dapp sign
+    dialog — Requested by, To + identity, Spender for an approve, the decoded
+    call, the Events preview, the revert banner — with Tron's resources in
+    place of gas.
+
+    READ-ONLY: the bytes are the dapp's TronWeb's, signed exactly as reviewed
+    (``TronSignWorker``) and handed back for the dapp to broadcast. So there's
+    no allowance editor, the fee limit is the dapp's own (flagged when the
+    estimate outgrows it), and the expiration — TronWeb gives a transaction
+    a minute — counts down, since an expired one can only be refused."""
+
+    def __init__(self, tron_req: TronSigningRequest, chain, **kwargs):
+        # Read by the header / fee hooks the base __init__ runs.
+        self.tron_req = tron_req
+        tx = tron_req.tx
+        c = tx.contract
+        if isinstance(c, TronTransferContract):
+            to, value, data = c.to, c.amount, "0x"
+        else:
+            # Decode-side view only: a 41-prefixed address word would defeat
+            # the ABI decode (the TVM masks it — the same call either way).
+            to, value = c.contract, c.call_value
+            data = strip_tron_address_prefixes("0x" + c.data.hex())
+        req = SigningRequest(chain_id=chain.chain_id, from_addr=tx.owner,
+                             to_addr=to, value_wei=value, data=data,
+                             origin=tron_req.origin)
+        super().__init__(req, chain, **kwargs)
+        self._expiry_timer = QTimer(self)
+        self._expiry_timer.setInterval(1000)
+        self._expiry_timer.timeout.connect(self._tick_expiry)
+        self._expiry_timer.start()
+        self._tick_expiry()
+
+    def _build_header_rows(self, header: QFormLayout, outer) -> None:
+        super()._build_header_rows(header, outer)
+        memo = self.tron_req.tx.memo
+        if memo:
+            try:
+                text = memo.decode("utf-8")
+            except UnicodeDecodeError:
+                text = "0x" + memo.hex()
+            header.addRow("Memo:", self._value_label(text, monospace=True))
+        self._expiry_lbl = self._value_label("")
+        header.addRow("Expires:", self._expiry_lbl)
+
+    def _build_allowance_editor(self, header: QFormLayout) -> None:
+        """None: the approve amount is part of the dapp's signed bytes."""
+
+    def _tick_expiry(self) -> None:
+        import time
+        left = self.tron_req.tx.expiration / 1000 - time.time()
+        if left > 0:
+            self._expiry_lbl.setText(
+                f"in {int(left)} s" if left < 120 else f"in {int(left // 60)} min")
+            self._expiry_lbl.setStyleSheet("")
+            return
+        self._expiry_lbl.setText(
+            "⚠ expired — the network will refuse it; retry in the dapp")
+        bg, fg = _IDENTITY_TINT["warn"]      # the revert banner's pill
+        self._expiry_lbl.setStyleSheet(
+            f"background:{bg}; color:{fg}; padding:1px 6px; border-radius:4px;")
+        self._expiry_timer.stop()
+
+    def _kick_gas(self, probe: SigningRequest) -> None:
+        # Estimate the dapp's exact contract (and its memo's fee).
+        self._kick_tron_fee(self.tron_req.tx.contract, self.tron_req.tx.memo)
+
+    def _fee_limit_text(self, fee) -> str:
+        tx = self.tron_req.tx
+        if isinstance(tx.contract, TronTransferContract):
+            return ""
+        text = f"{_trx(tx.fee_limit)} TRX — set by the dapp; the most the call may burn"
+        if fee.energy_burn > tx.fee_limit:
+            text += (f"\n⚠ the estimate ({_trx(fee.energy_burn)} TRX) exceeds it: "
+                     "the call would run out of energy and fail, still burning "
+                     "up to the limit")
+        return text
