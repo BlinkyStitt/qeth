@@ -197,7 +197,7 @@ def test_mainwindow_saves_multiple_chains_without_changing_active_chain(mainwind
         return QDialog.DialogCode.Accepted
 
     monkeypatch.setattr(ChainRpcDialog, "exec", edit)
-    mainwindow._on_edit_chain_rpc()
+    mainwindow.show_settings()
     assert [chain.rpc_url for chain in chains] == [f"https://new-{chain.chain_id}.example"
                                                  for chain in chains]
     assert mainwindow.store.current_chain_id == active_id
@@ -227,6 +227,6 @@ def test_mainwindow_cancel_discards_all_chain_edits(mainwindow, monkeypatch):
         return QDialog.DialogCode.Rejected
 
     monkeypatch.setattr(ChainRpcDialog, "exec", edit)
-    mainwindow._on_edit_chain_rpc()
+    mainwindow.show_settings()
     assert [chain.rpc_url for chain in mainwindow.store.chains] == before
     assert mainwindow.store.etherscan_api_key == key_before

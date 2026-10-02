@@ -1,7 +1,6 @@
-"""Dialog for editing the RPC URLs of existing chains.
+"""Settings dialog with per-chain RPC URLs and global preferences.
 
-Opens from the small button next to the chain selector in the
-toolbar. Two ways to set the URL:
+Opens from Settings in the window or tray. Two ways to set the URL:
 
 - Manual paste / edit in the URL field.
 - Click an entry from the chainlist.org-sourced list below the
@@ -28,12 +27,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from PySide6.QtCore import QCoreApplication, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialogButtonBox, QFormLayout,
+    QAbstractItemView, QCheckBox, QComboBox, QDialogButtonBox, QFormLayout, QHBoxLayout,
     QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QVBoxLayout,
 )
 
 from .dialog import Dialog, item_spacing
+from .plugin_toggle import build_plugin_checkboxes
 
 
 log = logging.getLogger("qeth.chain_rpc_dialog")
@@ -135,8 +135,7 @@ class _UrlProbeWorker(QThread):
 
 
 class ChainRpcDialog(Dialog):
-    """Edit JSON-RPC URLs for configured chains, plus the (global)
-    Etherscan v2 API key.
+    """Edit RPC URLs, the global Etherscan key, plugins and notifications.
 
     Host (MainWindow) reads ``self.rpc_urls`` and
     ``self.etherscan_api_key`` after ``exec() == Accepted`` and
@@ -146,7 +145,8 @@ class ChainRpcDialog(Dialog):
     supports), but the dialog is reachable from any chain so it
     can be set / changed from wherever the user happens to be."""
 
-    def __init__(self, chain, parent=None, etherscan_api_key: str = "", *, chains=None):
+    def __init__(self, chain, parent=None, etherscan_api_key: str = "", *, chains=None,
+                 disabled_plugins=(), notifications_enabled: bool = True):
         super().__init__(parent)
         self._chain = chain
         self._chains = list(chains) if chains is not None else [chain]
@@ -158,8 +158,8 @@ class ChainRpcDialog(Dialog):
         self._results: dict[str, tuple[float | None, bool, object]] = {}
         self._total_to_probe = 0
         self._done_probing = 0
-        self.setWindowTitle(f"RPC for {chain.name} ({chain.chain_id})")
-        self.resize(640, 540)
+        self.setWindowTitle("Settings")
+        self.resize(640, 600)
 
         outer = QVBoxLayout(self)
         # Margins + paragraph spacing come from the Dialog base (font-derived).
@@ -237,6 +237,20 @@ class ChainRpcDialog(Dialog):
         )
         outer.addLayout(key_form)
 
+        preferences = QVBoxLayout()
+        preferences.setSpacing(item_spacing(self))
+        self.notifications_check = QCheckBox("Transaction notifications")
+        self.notifications_check.setChecked(notifications_enabled)
+        preferences.addWidget(self.notifications_check)
+        preferences.addWidget(QLabel("Plugins (restart qeth to apply):"))
+        plugin_row = QHBoxLayout()
+        self.plugin_checks = build_plugin_checkboxes(disabled_plugins, self)
+        for check in self.plugin_checks.values():
+            plugin_row.addWidget(check)
+        plugin_row.addStretch()
+        preferences.addLayout(plugin_row)
+        outer.addLayout(preferences)
+
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
         )
@@ -283,7 +297,6 @@ class ChainRpcDialog(Dialog):
         self._rpc_urls[self._chain.chain_id] = self.rpc_url
         self._disconnect_loader()
         self._chain = self._chains[index]
-        self.setWindowTitle(f"RPC for {self._chain.name} ({self._chain.chain_id})")
         self._results.clear()
         self._total_to_probe = self._done_probing = 0
         self.picker.clear()
@@ -333,6 +346,14 @@ class ChainRpcDialog(Dialog):
     @property
     def etherscan_api_key(self) -> str:
         return self.etherscan_edit.text().strip()
+
+    @property
+    def plugin_enabled(self) -> dict[str, bool]:
+        return {pid: check.isChecked() for pid, check in self.plugin_checks.items()}
+
+    @property
+    def notifications_enabled(self) -> bool:
+        return self.notifications_check.isChecked()
 
     # --- loader callbacks -------------------------------------
 
