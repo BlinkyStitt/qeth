@@ -417,6 +417,7 @@ class MainWindow(QMainWindow):
         dlg = ChainRpcDialog(
             chain, parent=self,
             etherscan_api_key=self.store.etherscan_api_key or "",
+            chains=self.store.chains,
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -425,11 +426,14 @@ class MainWindow(QMainWindow):
         # changed independently. A "refresh against new endpoint"
         # broadcast covers either change — both affect what the
         # right-slot plugins see on their next discovery.
-        new_url = dlg.rpc_url
-        url_changed = bool(
-            new_url and new_url != chain.rpc_url
-            and self.store.set_chain_rpc_url(chain.chain_id, new_url)
-        )
+        changed_chains = []
+        urls = dlg.rpc_urls
+        for c in self.store.chains:
+            new_url = urls.get(c.chain_id, "")
+            if (new_url and new_url != c.rpc_url
+                    and self.store.set_chain_rpc_url(c.chain_id, new_url)):
+                changed_chains.append(c)
+        url_changed = bool(changed_chains)
         key_changed = self.store.set_etherscan_api_key(dlg.etherscan_api_key)
         if url_changed:
             # Helios bakes the execution-rpc in at spawn, so a running sidecar
@@ -437,9 +441,12 @@ class MainWindow(QMainWindow):
             # the changed RPC, retires the old process and spawns a fresh one on
             # the new endpoint (no-op if the chain isn't Helios-supported).
             from .helios import prewarm as _helios_prewarm
-            _helios_prewarm(self.store.current_chain())
+            if chain in changed_chains:
+                _helios_prewarm(self.store.current_chain())
             self.status_message(
-                f"RPC for {chain.name} updated to {new_url}", 4000,
+                (f"RPC for {changed_chains[0].name} updated to {changed_chains[0].rpc_url}"
+                 if len(changed_chains) == 1
+                 else f"RPC URLs updated for {len(changed_chains)} chains"), 4000,
             )
             # A chain entry changed — chainsChanged carries the whole list,
             # so subscribers pick up the new endpoint's connected state.
