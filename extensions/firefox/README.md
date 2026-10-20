@@ -1,13 +1,13 @@
 # Firefox package
 
-`qeth-0.23.1.xpi` is the Mozilla-signed, self-distributed build — install it via
+`qeth-0.25.0.xpi` is the Mozilla-signed, self-distributed build — install it via
 *about:addons → gear → Install Add-on From File…*. Release Firefox installs only
 signed extensions, so this file, not a source build, is what works today.
 
 Verify it is genuinely signed before trusting a copy:
 
 ```sh
-unzip -l qeth-0.23.1.xpi | grep META-INF
+unzip -l qeth-0.25.0.xpi | grep META-INF
 # META-INF/cose.sig, META-INF/mozilla.rsa, …
 ```
 

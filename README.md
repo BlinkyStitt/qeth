@@ -165,7 +165,7 @@ live in [`extensions/`](extensions/) and are attached to the
   [`extensions/chrome/`](extensions/chrome/) and use `chrome://extensions` →
   Developer mode → Load unpacked.
 - **Firefox** — install the Mozilla-signed
-  [`extensions/firefox/qeth-0.23.1.xpi`](extensions/firefox/) via *about:addons
+  [`extensions/firefox/qeth-0.25.0.xpi`](extensions/firefox/) via *about:addons
   → gear → Install Add-on From File…*. It is self-distributed rather than
   listed on addons.mozilla.org, so the file is the only way to get it — there
   is no listing page to link to. To build and load it yourself instead, use one
