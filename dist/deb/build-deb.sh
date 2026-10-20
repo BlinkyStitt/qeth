@@ -36,13 +36,25 @@ if ! "$VENV/bin/$PY" -c "import shiboken6, PySide6.QtWidgets, PySide6.QtNetwork,
     "$HERE/build-pyside.sh" "$VENV"
 fi
 
-# 2. qeth + the eth stack into the same venv (vendored). pip's build isolation
-#    keeps the venv's build-pinned setuptools out of the dep installs.
+# 2. qeth + the eth stack into a FRESH venv (vendored), not the cached PySide6
+#    one: pip keeps an already-satisfied requirement, so installing into the
+#    reused cache froze every dependency at whatever its first build pulled (at
+#    0.25.0: the pre-eMudhra certifi 2026.7.22, urllib3 2.7.0) and kept deps
+#    qeth has since dropped. PySide6 + shiboken6 are copied from the cache in 3.
 #    [simulate] = the pure-Python py-evm fork engine: event previews on RPCs
 #    without eth_simulateV1, and Helios-verified previews when the user has
 #    a helios binary installed. [qr] = the air-gapped QR signer decode stack
 #    (cbor2 + zxing-cpp reader + Pillow), vendored as PyPI wheels.
-"$VENV/bin/$PY" -m pip install --no-warn-script-location --no-compile "$REPO[simulate,qr,trezor]"
+DEPS="$(mktemp -d)/venv"
+"$PY" -m venv "$DEPS"
+"$DEPS/bin/$PY" -m pip install -q --upgrade pip
+"$DEPS/bin/$PY" -m pip install --no-warn-script-location --no-compile "$REPO[simulate,qr,trezor]"
+# [bundled] (PyPI PySide6) is never requested, so none may be in the closure —
+# the from-source one built against the system Qt is the whole point.
+if ls -d "$DEPS"/lib/"$PY"/site-packages/PySide6* >/dev/null 2>&1; then
+    echo "!! PySide6 leaked into the dependency closure" >&2
+    exit 1
+fi
 
 # 3. Assemble the .deb tree.
 STAGE="$(mktemp -d)/qeth"
@@ -50,7 +62,10 @@ VENDOR="$STAGE/usr/lib/qeth/vendor"
 install -d "$VENDOR" "$STAGE/usr/bin" \
         "$STAGE/usr/share/applications" \
         "$STAGE/usr/share/icons/hicolor/scalable/apps" "$STAGE/DEBIAN"
-cp -a "$VENV"/lib/"$PY"/site-packages/. "$VENDOR/"
+cp -a "$DEPS"/lib/"$PY"/site-packages/. "$VENDOR/"
+cp -a "$VENV"/lib/"$PY"/site-packages/PySide6* \
+      "$VENV"/lib/"$PY"/site-packages/shiboken6* "$VENDOR/"
+rm -rf "$(dirname "$DEPS")"
 # Drop venv/pip bookkeeping — keep PySide6 + shiboken6 + qeth + the runtime deps.
 rm -rf "$VENDOR"/pip "$VENDOR"/pip-*.dist-info \
        "$VENDOR"/setuptools "$VENDOR"/setuptools-*.dist-info \
