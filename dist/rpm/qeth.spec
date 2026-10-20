@@ -1,5 +1,5 @@
 Name:           qeth
-Version:        0.24.0
+Version:        0.25.0
 Release:        1%{?dist}
 Summary:        Qt Ethereum wallet with Ledger support and a Frame-compatible JSON-RPC server
 
@@ -135,6 +135,19 @@ install -Dm0644 qeth/assets/logos/qeth-icon-rounded.svg \
 %{_datadir}/icons/hicolor/scalable/apps/io.github.michwill.qeth.svg
 
 %changelog
+* Tue Oct 20 2026 Michael Egorov <michwill@yieldbasis.com> - 0.25.0-1
+- Tron network: TRX / TRC-20 balances, discovery, prices and history; send
+  with Tron's bandwidth / activation / energy fees; hot-wallet and Trezor
+  signing; a connected account per chain family
+- Robinhood Chain (4663) as a default network
+- Hot wallets stay unlocked for 5 minutes after the last signature
+- Steadier, less dense animated signing QR codes for air-gapped signers
+- Security: certifi 2026.10.19 drops the root that trusted the compromised
+  eMudhra intermediates; the -verify variant bundles Helios 0.12.0, which no
+  longer compiles in its own CA list (0.11.1 trusted them too)
+- Fixed: a Safe-batch ABI refetch loop on explorer rate limits; Ctrl+C now
+  quits when the window is hidden in the tray
+
 * Sun Sep 13 2026 Michael Egorov <michwill@yieldbasis.com> - 0.24.0-1
 - Trezor hardware wallets: add accounts (BIP44 / Ledger Live / Legacy) and sign
   transactions, messages and EIP-712 typed data; passphrase wallets get their
