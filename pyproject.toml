@@ -40,6 +40,13 @@ dependencies = [
     # arbitrary-precision-int correct (uint256 value_wei). The import is guarded
     # + falls back to stdlib json, so a build without it still works (slower).
     "ujson>=5",
+    # A cap, not an import: pyunormalize 18 made NFC() str-only, but web3's
+    # ENSIP-15 normalizer (ens/_normalization.py — unchanged in web3 8.0.0)
+    # passes it a list of code points, so normalize_name() raises on EVERY name
+    # and name_warning() flags them all as look-alikes. Declared here, not as a
+    # uv constraint, because the pip-built packages resolve fresh from PyPI.
+    # Drop once web3 adapts.
+    "pyunormalize<18",
 ]
 
 [project.optional-dependencies]
@@ -126,18 +133,33 @@ macos-build = [
 # maintain. Applies to every `uv lock` (incl. `--upgrade`).
 #
 # Bump deps:   uv lock --upgrade && uv sync --inexact && uv audit
-# A fresh SECURITY fix can be pulled forward past the cutoff for one package,
-# and it STICKS (a later plain `uv lock` won't revert an already-locked
-# version):
-#   uv lock --upgrade-package <pkg> --exclude-newer-package <pkg>=<recent-date>
-# That's how aiohttp sits on 3.14.1 here, ahead of the cutoff (6 CVEs fixed).
+# A fresh SECURITY fix is pulled forward past the cutoff for one package by a
+# dated entry in [tool.uv.exclude-newer-package] below — NOT the CLI flag:
+# uv records `--exclude-newer-package` in uv.lock's [options], so the next
+# plain `uv lock` (which `uv run` / `uv sync` also do implicitly) sees options
+# differing from this file and silently reverts the package (verified, uv
+# 0.12.17). A dated entry is a fixed cap, not a rolling one: delete it once the
+# 1-week cutoff has passed its date, or that package stays frozen there.
 exclude-newer = "1 week"
+# Floors on transitive deps — uv resolution only, not package metadata, so the
+# pip-built packages and a distro's own certifi shim are untouched. They make
+# a resolve that would regress past a security fix FAIL instead of silently
+# downgrading (e.g. dropping the dated certifi entry below too early).
+#   certifi < 2026.10.19 trusts the compromised eMudhra intermediates (below).
+constraint-dependencies = ["certifi>=2026.10.19"]
 
 [tool.uv.exclude-newer-package]
 # ty is a fast-moving preview tool we run locally (never shipped) and track at
 # its latest; its pin is otherwise unsatisfiable under the 1-week cutoff.
 # Exempt it — effectively no cutoff for ty.
 ty = "2099-01-01T00:00:00Z"
+# eMudhra intermediate-CA key compromise (emudhra.we-have-a-problem.com,
+# 2026-10-17): certifi <= 2026.7.22 ships "emSign ECC Root CA - G3", which
+# cross-signs the compromised TLS intermediates, so requests (web3's HTTP
+# provider) — and in the AppImage, whose AppRun points SSL_CERT_FILE at
+# certifi's bundle, ALL of qeth's HTTPS — trusted them. 2026.10.19 drops it.
+# Remove this entry after 2026-10-27, once the rolling cutoff has passed it.
+certifi = "2026-10-20T12:00:00Z"
 
 [tool.pytest.ini_options]
 # Network tests exercise real Blockscout / DefiLlama / GoPlus / Curve /
@@ -343,6 +365,7 @@ ignore = ["UP031"]
 #     not the runtime provision either way.
 #   - Falkon: the host browser's plugin API, present only inside Falkon.
 #   - py-evm imports as `eth` (+ owns `eth.*`); web3 ships the `ens` module.
+#   - pyunormalize: declared only to cap web3's transitive (see dependencies).
 known_first_party = ["qeth_connector"]
 
 [tool.deptry.package_module_name_map]
@@ -356,7 +379,7 @@ trezor = ["trezorlib"]
 [tool.deptry.per_rule_ignores]
 # DEP001 = imported but undeclared; DEP002 = declared but unused.
 DEP001 = ["PySide6", "Falkon"]
-DEP002 = ["PySide6"]
+DEP002 = ["PySide6", "pyunormalize"]
 
 [project.scripts]
 qeth = "qeth.__main__:main"
