@@ -63,7 +63,7 @@ jobs:
       # no display is needed. Network- and browser-marked tests are deselected
       # by the addopts default.
       - name: Test suite
-        run: uv run pytest -q
+        run: uv run pytest -vv -o faulthandler_timeout=120
 
       # Informational: the same static checks the suite already gates on, run
       # standalone so a failure reads as "lint/types" rather than a test id.

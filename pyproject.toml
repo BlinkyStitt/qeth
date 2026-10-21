@@ -134,6 +134,8 @@ macos-build = [
 exclude-newer = "1 week"
 
 [tool.uv.exclude-newer-package]
+# Emergency eMudhra distrust release; keep the age gate for all other packages.
+certifi = "2026-10-20T20:00:00Z"
 # ty is a fast-moving preview tool we run locally (never shipped) and track at
 # its latest; its pin is otherwise unsatisfiable under the 1-week cutoff.
 # Exempt it — effectively no cutoff for ty.
