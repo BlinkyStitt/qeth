@@ -31,6 +31,10 @@ on:
       - 'uv.lock'
       - 'dist/macos/**'
 
+concurrency:
+  group: pr-ci-macos.yml-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   tests:
     runs-on: macos-15
