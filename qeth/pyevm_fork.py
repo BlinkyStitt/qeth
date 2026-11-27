@@ -32,6 +32,7 @@ Layout:
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from eth_utils import to_canonical_address, to_checksum_address
@@ -267,7 +268,6 @@ class RpcStateReader(StateReader):
         concurrent individual requests (see _SEED_CONCURRENCY)."""
         import json as _json
         import urllib.request as _u
-        from concurrent.futures import ThreadPoolExecutor
         from . import USER_AGENT
 
         keys: list[tuple] = []
